@@ -1,71 +1,29 @@
-// server.js - Main Express server
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs').promises;
-require('dotenv').config();
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Database configuration
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
 // Middleware
-app.use(helmet());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: process.env.FRONTEND_URL || '*',
   credentials: true
 }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
-});
-app.use(limiter);
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || '3rtesting-super-secure-secret-key';
 
-// File upload configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  }
-});
-const upload = multer({ storage });
-
-// Database connection
-const dbConfig = {
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'lims_3r_testing',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-};
-
-const pool = mysql.createPool(dbConfig);
-
-// Test database connection
-pool.getConnection()
-  .then(connection => {
-    console.log('✅ Database connected successfully');
-    connection.release();
-  })
-  .catch(err => {
-    console.error('❌ Database connection failed:', err);
-    process.exit(1);
-  });
-
-// Middleware to verify JWT token
+// Authentication middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -74,7 +32,7 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret', (err, user) => {
+  jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
       return res.status(403).json({ error: 'Invalid token' });
     }
@@ -83,256 +41,335 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// =====================
-// CUSTOMERS API ROUTES
-// =====================
+// Database query helper
+async function query(text, params) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(text, params);
+    return result;
+  } finally {
+    client.release();
+  }
+}
 
-// Get all customers
+// Initialize database tables
+async function initializeDatabase() {
+  try {
+    console.log('Initializing database tables...');
+    
+    // Users table
+    await query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(20) DEFAULT 'user',
+        email VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Customers table
+    await query(`
+      CREATE TABLE IF NOT EXISTS customers (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        company_name VARCHAR(100),
+        phone VARCHAR(20),
+        shipping_address TEXT,
+        billing_address TEXT,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Orders table
+    await query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        customer_id INTEGER REFERENCES customers(id),
+        order_number VARCHAR(50) UNIQUE,
+        sample_count INTEGER NOT NULL,
+        shipping_method VARCHAR(50),
+        priority VARCHAR(20) DEFAULT 'normal',
+        status VARCHAR(50) DEFAULT 'pending',
+        tracking_number VARCHAR(100),
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Samples table (NEW)
+    await query(`
+      CREATE TABLE IF NOT EXISTS samples (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER REFERENCES orders(id),
+        barcode VARCHAR(50) UNIQUE NOT NULL,
+        sample_type VARCHAR(50) DEFAULT 'environmental',
+        status VARCHAR(50) DEFAULT 'pending',
+        received_at TIMESTAMP,
+        processed_at TIMESTAMP,
+        completed_at TIMESTAMP,
+        batch_id VARCHAR(50),
+        location VARCHAR(100),
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Test Results table (NEW)
+    await query(`
+      CREATE TABLE IF NOT EXISTS test_results (
+        id SERIAL PRIMARY KEY,
+        sample_id INTEGER REFERENCES samples(id),
+        test_type VARCHAR(100) NOT NULL,
+        result VARCHAR(50),
+        value DECIMAL(10,3),
+        units VARCHAR(20),
+        detection_limit DECIMAL(10,3),
+        method VARCHAR(100),
+        analyst VARCHAR(100),
+        analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        notes TEXT
+      )
+    `);
+
+    // Batches table (NEW)
+    await query(`
+      CREATE TABLE IF NOT EXISTS batches (
+        id SERIAL PRIMARY KEY,
+        batch_number VARCHAR(50) UNIQUE NOT NULL,
+        test_type VARCHAR(100),
+        status VARCHAR(50) DEFAULT 'pending',
+        created_by INTEGER REFERENCES users(id),
+        sample_count INTEGER DEFAULT 0,
+        started_at TIMESTAMP,
+        completed_at TIMESTAMP,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Quality Control table (NEW)
+    await query(`
+      CREATE TABLE IF NOT EXISTS quality_control (
+        id SERIAL PRIMARY KEY,
+        batch_id INTEGER REFERENCES batches(id),
+        control_type VARCHAR(50),
+        expected_result VARCHAR(50),
+        actual_result VARCHAR(50),
+        passed BOOLEAN,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Check if admin user exists, create if not
+    const adminCheck = await query('SELECT * FROM users WHERE username = $1', ['admin']);
+    if (adminCheck.rows.length === 0) {
+      const hashedPassword = await bcrypt.hash('admin123', 10);
+      await query(
+        'INSERT INTO users (username, password_hash, role, email) VALUES ($1, $2, $3, $4)',
+        ['admin', hashedPassword, 'admin', 'admin@3rtesting.com']
+      );
+      console.log('Admin user created');
+    }
+
+    console.log('✅ Database tables initialized successfully');
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    throw error;
+  }
+}
+
+// Routes
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    message: '3R Testing LIMS Backend is running',
+    database: 'PostgreSQL'
+  });
+});
+
+// Authentication routes
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    const result = await query('SELECT * FROM users WHERE username = $1', [username]);
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign(
+      { userId: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Customer routes
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
-    const [rows] = await pool.execute(`
-      SELECT c.*, 
-             COUNT(o.id) as total_orders,
-             MAX(o.created_at) as last_order_date
+    const result = await query(`
+      SELECT c.*, COUNT(o.id) as total_orders 
       FROM customers c 
       LEFT JOIN orders o ON c.id = o.customer_id 
       GROUP BY c.id 
       ORDER BY c.created_at DESC
     `);
-    res.json(rows);
+    res.json(result.rows);
   } catch (error) {
     console.error('Error fetching customers:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
   }
 });
 
-// Create new customer
 app.post('/api/customers', authenticateToken, async (req, res) => {
-  const {
-    name, email, company_name, phone, 
-    shipping_address, billing_address, notes
-  } = req.body;
-
   try {
-    // Check for duplicate customer
-    const [existing] = await pool.execute(
-      'SELECT id, name, email, company_name FROM customers WHERE email = ? OR company_name = ?',
-      [email, company_name]
+    const { name, email, company_name, phone, shipping_address, billing_address, notes } = req.body;
+    
+    const result = await query(
+      `INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address, notes) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [name, email, company_name, phone, shipping_address, billing_address, notes]
     );
-
-    if (existing.length > 0) {
-      return res.status(409).json({
-        error: 'Customer already exists',
-        existing_customer: existing[0]
-      });
-    }
-
-    const [result] = await pool.execute(`
-      INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `, [name, email, company_name, phone, shipping_address, billing_address, notes]);
-
-    res.status(201).json({
-      id: result.insertId,
-      message: 'Customer created successfully'
-    });
+    
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error creating customer:', error);
-    res.status(500).json({ error: 'Failed to create customer' });
+    if (error.code === '23505') {
+      res.status(400).json({ error: 'Customer with this email already exists' });
+    } else {
+      res.status(500).json({ error: 'Failed to create customer' });
+    }
   }
 });
 
-// ==================
-// ORDERS API ROUTES
-// ==================
-
-// Get all orders with customer information
+// Order routes
 app.get('/api/orders', authenticateToken, async (req, res) => {
   try {
-    const [orders] = await pool.execute(`
+    const result = await query(`
       SELECT o.*, c.name as customer_name, c.email as customer_email, c.company_name,
-             COUNT(s.id) as total_samples,
-             COUNT(CASE WHEN s.status = 'received' THEN 1 END) as received_samples
+             COUNT(s.id) as received_samples
       FROM orders o 
-      LEFT JOIN customers c ON o.customer_id = c.id
-      LEFT JOIN samples s ON o.id = s.order_id
-      GROUP BY o.id
+      JOIN customers c ON o.customer_id = c.id 
+      LEFT JOIN samples s ON o.id = s.order_id AND s.status != 'pending'
+      GROUP BY o.id, c.name, c.email, c.company_name
       ORDER BY o.created_at DESC
     `);
-    res.json(orders);
+    res.json(result.rows);
   } catch (error) {
     console.error('Error fetching orders:', error);
     res.status(500).json({ error: 'Failed to fetch orders' });
   }
 });
 
-// Create new order (manual or from WooCommerce)
 app.post('/api/orders', authenticateToken, async (req, res) => {
-  const {
-    customer_id, woocommerce_order_id, sample_count, 
-    shipping_method, notes, source = 'manual'
-  } = req.body;
-
   try {
-    const connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    try {
-      // Create order
-      const [orderResult] = await connection.execute(`
-        INSERT INTO orders (customer_id, woocommerce_order_id, sample_count, 
-                           status, shipping_method, notes, source)
-        VALUES (?, ?, ?, 'pending', ?, ?, ?)
-      `, [customer_id, woocommerce_order_id, sample_count, shipping_method, notes, source]);
-
-      const orderId = orderResult.insertId;
-
-      // Generate order number (format: year + sequential number)
-      const year = new Date().getFullYear();
-      const orderNumber = `${year}${orderId.toString().padStart(4, '0')}`;
-      
-      await connection.execute(
-        'UPDATE orders SET order_number = ? WHERE id = ?',
-        [orderNumber, orderId]
+    const { customer_id, sample_count, shipping_method, priority, notes } = req.body;
+    
+    // Generate order number
+    const orderNumber = 'ORD-' + Date.now();
+    
+    const result = await query(
+      `INSERT INTO orders (customer_id, order_number, sample_count, shipping_method, priority, notes) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [customer_id, orderNumber, sample_count, shipping_method, priority, notes]
+    );
+    
+    // Generate sample barcodes for this order
+    const order = result.rows[0];
+    for (let i = 1; i <= sample_count; i++) {
+      const barcode = `${orderNumber}-S${i.toString().padStart(2, '0')}`;
+      await query(
+        'INSERT INTO samples (order_id, barcode) VALUES ($1, $2)',
+        [order.id, barcode]
       );
-
-      await connection.commit();
-      connection.release();
-
-      res.status(201).json({
-        id: orderId,
-        order_number: orderNumber,
-        message: 'Order created successfully'
-      });
-    } catch (error) {
-      await connection.rollback();
-      connection.release();
-      throw error;
     }
+    
+    res.json(order);
   } catch (error) {
     console.error('Error creating order:', error);
     res.status(500).json({ error: 'Failed to create order' });
   }
 });
 
-// Update order status
-app.patch('/api/orders/:id/status', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { status, tracking_number, notes } = req.body;
-
+// Sample routes (NEW)
+app.get('/api/samples', authenticateToken, async (req, res) => {
   try {
-    const updateFields = ['status = ?'];
-    const values = [status];
-
-    if (tracking_number) {
-      updateFields.push('tracking_number = ?');
-      values.push(tracking_number);
-    }
-
-    if (status === 'shipped') {
-      updateFields.push('shipped_at = NOW()');
-    } else if (status === 'received_customer') {
-      updateFields.push('delivered_at = NOW()');
-    } else if (status === 'processing') {
-      updateFields.push('received_at = NOW()');
-    } else if (status === 'complete') {
-      updateFields.push('completed_at = NOW()');
-    }
-
-    values.push(id);
-
-    await pool.execute(`
-      UPDATE orders SET ${updateFields.join(', ')} WHERE id = ?
-    `, values);
-
-    // Log status change
-    await pool.execute(`
-      INSERT INTO order_status_log (order_id, old_status, new_status, notes, changed_by)
-      VALUES (?, (SELECT status FROM orders WHERE id = ? LIMIT 1), ?, ?, ?)
-    `, [id, id, status, notes, req.user.id]);
-
-    res.json({ message: 'Order status updated successfully' });
-  } catch (error) {
-    console.error('Error updating order status:', error);
-    res.status(500).json({ error: 'Failed to update order status' });
-  }
-});
-
-// ===================
-// SAMPLES API ROUTES
-// ===================
-
-// Assign barcode to order
-app.post('/api/orders/:orderId/samples', authenticateToken, async (req, res) => {
-  const { orderId } = req.params;
-  const { barcodes } = req.body; // Array of barcode strings
-
-  try {
-    const connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    try {
-      for (const barcode of barcodes) {
-        // Check if barcode already exists
-        const [existing] = await connection.execute(
-          'SELECT id FROM samples WHERE barcode = ?',
-          [barcode]
-        );
-
-        if (existing.length > 0) {
-          throw new Error(`Barcode ${barcode} already assigned`);
-        }
-
-        // Insert sample
-        await connection.execute(`
-          INSERT INTO samples (order_id, barcode, status, created_by)
-          VALUES (?, ?, 'assigned', ?)
-        `, [orderId, barcode, req.user.id]);
-      }
-
-      await connection.commit();
-      connection.release();
-
-      res.json({ message: 'Barcodes assigned successfully' });
-    } catch (error) {
-      await connection.rollback();
-      connection.release();
-      throw error;
-    }
-  } catch (error) {
-    console.error('Error assigning barcodes:', error);
-    res.status(500).json({ error: error.message || 'Failed to assign barcodes' });
-  }
-});
-
-// Receive sample by barcode scan
-app.post('/api/samples/receive', authenticateToken, async (req, res) => {
-  const { barcode } = req.body;
-
-  try {
-    const [samples] = await pool.execute(`
-      SELECT s.*, o.order_number, o.customer_id, c.name as customer_name
+    const result = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name, c.company_name,
+             COUNT(tr.id) as test_count
       FROM samples s
       JOIN orders o ON s.order_id = o.id
       JOIN customers c ON o.customer_id = c.id
-      WHERE s.barcode = ?
-    `, [barcode]);
+      LEFT JOIN test_results tr ON s.id = tr.sample_id
+      GROUP BY s.id, o.order_number, c.name, c.company_name
+      ORDER BY s.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching samples:', error);
+    res.status(500).json({ error: 'Failed to fetch samples' });
+  }
+});
 
-    if (samples.length === 0) {
-      return res.status(404).json({ error: 'Barcode not found' });
-    }
-
-    const sample = samples[0];
-
-    // Update sample status
-    await pool.execute(
-      'UPDATE samples SET status = ?, received_at = NOW() WHERE barcode = ?',
-      ['received', barcode]
+app.post('/api/samples/receive', authenticateToken, async (req, res) => {
+  try {
+    const { barcode, location = 'Main Lab', notes = '' } = req.body;
+    
+    const result = await query(
+      `UPDATE samples 
+       SET status = 'received', received_at = CURRENT_TIMESTAMP, location = $2, notes = $3
+       WHERE barcode = $1 
+       RETURNING *`,
+      [barcode, location, notes]
     );
-
-    res.json({
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+    
+    // Get customer info
+    const sampleInfo = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      JOIN customers c ON o.customer_id = c.id
+      WHERE s.id = $1
+    `, [result.rows[0].id]);
+    
+    res.json({ 
       message: 'Sample received successfully',
-      sample: sample
+      sample: sampleInfo.rows[0]
     });
   } catch (error) {
     console.error('Error receiving sample:', error);
@@ -340,254 +377,192 @@ app.post('/api/samples/receive', authenticateToken, async (req, res) => {
   }
 });
 
-// Generate Excel export for batch processing
-app.get('/api/samples/export/:orderId', authenticateToken, async (req, res) => {
-  const { orderId } = req.params;
-
+app.patch('/api/samples/:id/status', authenticateToken, async (req, res) => {
   try {
-    const [samples] = await pool.execute(`
-      SELECT s.barcode, s.status, o.order_number
-      FROM samples s
-      JOIN orders o ON s.order_id = o.id
-      WHERE s.order_id = ? AND s.status = 'received'
-      ORDER BY s.created_at
-      LIMIT 92
-    `, [orderId]);
-
-    // Generate Excel-compatible data structure
-    const excelData = samples.map((sample, index) => ({
-      well_position: `${String.fromCharCode(65 + Math.floor(index / 12))}${(index % 12) + 1}`,
-      barcode: sample.barcode,
-      order_number: sample.order_number,
-      sample_id: sample.barcode
-    }));
-
-    res.json({
-      data: excelData,
-      total_samples: samples.length,
-      max_samples: 92
-    });
-  } catch (error) {
-    console.error('Error generating export:', error);
-    res.status(500).json({ error: 'Failed to generate export' });
-  }
-});
-
-// ==================
-// RESULTS API ROUTES
-// ==================
-
-// Upload results file
-app.post('/api/orders/:orderId/results', authenticateToken, upload.single('results'), async (req, res) => {
-  const { orderId } = req.params;
-  const { notes, version } = req.body;
-
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  try {
-    const [result] = await pool.execute(`
-      INSERT INTO results (order_id, file_path, file_name, file_size, 
-                          version, notes, uploaded_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `, [
-      orderId, 
-      req.file.path, 
-      req.file.originalname, 
-      req.file.size,
-      version || 1,
-      notes,
-      req.user.id
-    ]);
-
-    // Update order status to results_pending
-    await pool.execute(
-      'UPDATE orders SET status = ? WHERE id = ?',
-      ['results_pending', orderId]
-    );
-
-    res.json({
-      id: result.insertId,
-      message: 'Results uploaded successfully'
-    });
-  } catch (error) {
-    console.error('Error uploading results:', error);
-    res.status(500).json({ error: 'Failed to upload results' });
-  }
-});
-
-// Send results via email
-app.post('/api/orders/:orderId/send-results', authenticateToken, async (req, res) => {
-  const { orderId } = req.params;
-  const { email_message, send_sms } = req.body;
-
-  try {
-    // Get order and customer details
-    const [orders] = await pool.execute(`
-      SELECT o.*, c.name, c.email, c.phone, r.file_path, r.file_name
-      FROM orders o
-      JOIN customers c ON o.customer_id = c.id
-      LEFT JOIN results r ON o.id = r.order_id
-      WHERE o.id = ?
-      ORDER BY r.version DESC
-      LIMIT 1
-    `, [orderId]);
-
-    if (orders.length === 0) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    const order = orders[0];
-
-    // TODO: Implement actual email sending (see email integration section)
-    console.log(`Sending results email to: ${order.email}`);
-    console.log(`Message: ${email_message}`);
-
-    if (send_sms && order.phone) {
-      // TODO: Implement SMS sending
-      console.log(`Sending SMS notification to: ${order.phone}`);
-    }
-
-    // Log email sent
-    await pool.execute(`
-      INSERT INTO email_log (order_id, recipient_email, subject, message, sent_by)
-      VALUES (?, ?, ?, ?, ?)
-    `, [orderId, order.email, `Test Results - Order ${order.order_number}`, email_message, req.user.id]);
-
-    // Update order status to complete
-    await pool.execute(
-      'UPDATE orders SET status = ?, completed_at = NOW() WHERE id = ?',
-      ['complete', orderId]
-    );
-
-    res.json({ message: 'Results sent successfully' });
-  } catch (error) {
-    console.error('Error sending results:', error);
-    res.status(500).json({ error: 'Failed to send results' });
-  }
-});
-
-// ==========================
-// WOOCOMMERCE WEBHOOK ROUTE
-// ==========================
-
-app.post('/api/webhooks/woocommerce', async (req, res) => {
-  try {
-    const orderData = req.body;
+    const { id } = req.params;
+    const { status, batch_id, notes } = req.body;
     
-    // Verify webhook signature (implement based on WooCommerce settings)
-    // const signature = req.headers['x-wc-webhook-signature'];
+    let updateQuery = 'UPDATE samples SET status = $1';
+    let params = [status];
+    let paramCount = 1;
     
-    console.log('Received WooCommerce webhook:', orderData.id);
-
-    const connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    try {
-      // Create or find customer
-      let customerId;
-      const [existingCustomer] = await connection.execute(
-        'SELECT id FROM customers WHERE email = ?',
-        [orderData.billing.email]
-      );
-
-      if (existingCustomer.length > 0) {
-        customerId = existingCustomer[0].id;
-      } else {
-        const [customerResult] = await connection.execute(`
-          INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `, [
-          `${orderData.billing.first_name} ${orderData.billing.last_name}`,
-          orderData.billing.email,
-          orderData.billing.company || '',
-          orderData.billing.phone || '',
-          `${orderData.shipping.address_1} ${orderData.shipping.address_2}, ${orderData.shipping.city}, ${orderData.shipping.state} ${orderData.shipping.postcode}`,
-          `${orderData.billing.address_1} ${orderData.billing.address_2}, ${orderData.billing.city}, ${orderData.billing.state} ${orderData.billing.postcode}`
-        ]);
-        customerId = customerResult.insertId;
-      }
-
-      // Calculate total sample count from line items
-      const sampleCount = orderData.line_items.reduce((total, item) => {
-        return total + item.quantity;
-      }, 0);
-
-      // Create order
-      const [orderResult] = await connection.execute(`
-        INSERT INTO orders (customer_id, woocommerce_order_id, sample_count, status, source)
-        VALUES (?, ?, ?, 'pending', 'woocommerce')
-      `, [customerId, orderData.id, sampleCount]);
-
-      const orderId = orderResult.insertId;
-      const year = new Date().getFullYear();
-      const orderNumber = `${year}${orderId.toString().padStart(4, '0')}`;
-      
-      await connection.execute(
-        'UPDATE orders SET order_number = ? WHERE id = ?',
-        [orderNumber, orderId]
-      );
-
-      await connection.commit();
-      connection.release();
-
-      res.json({ message: 'Order created from WooCommerce', order_id: orderId });
-    } catch (error) {
-      await connection.rollback();
-      connection.release();
-      throw error;
+    if (status === 'processing') {
+      updateQuery += ', processed_at = CURRENT_TIMESTAMP';
+    } else if (status === 'complete') {
+      updateQuery += ', completed_at = CURRENT_TIMESTAMP';
     }
+    
+    if (batch_id) {
+      paramCount++;
+      updateQuery += `, batch_id = $${paramCount}`;
+      params.push(batch_id);
+    }
+    
+    if (notes) {
+      paramCount++;
+      updateQuery += `, notes = $${paramCount}`;
+      params.push(notes);
+    }
+    
+    paramCount++;
+    updateQuery += ` WHERE id = $${paramCount} RETURNING *`;
+    params.push(id);
+    
+    const result = await query(updateQuery, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+    
+    res.json(result.rows[0]);
   } catch (error) {
-    console.error('Error processing WooCommerce webhook:', error);
-    res.status(500).json({ error: 'Failed to process webhook' });
+    console.error('Error updating sample status:', error);
+    res.status(500).json({ error: 'Failed to update sample status' });
   }
 });
 
-// ===============
-// UTILITY ROUTES
-// ===============
-
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+// Batch routes (NEW)
+app.get('/api/batches', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT b.*, u.username as created_by_name,
+             COUNT(s.id) as actual_sample_count
+      FROM batches b
+      LEFT JOIN users u ON b.created_by = u.id
+      LEFT JOIN samples s ON b.batch_number = s.batch_id
+      GROUP BY b.id, u.username
+      ORDER BY b.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching batches:', error);
+    res.status(500).json({ error: 'Failed to fetch batches' });
+  }
 });
 
-// Get dashboard statistics
+app.post('/api/batches', authenticateToken, async (req, res) => {
+  try {
+    const { test_type, sample_ids, notes } = req.body;
+    
+    // Generate batch number
+    const batchNumber = 'BATCH-' + Date.now();
+    
+    const result = await query(
+      `INSERT INTO batches (batch_number, test_type, created_by, sample_count, notes) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [batchNumber, test_type, req.user.userId, sample_ids.length, notes]
+    );
+    
+    // Update samples with batch ID
+    for (const sampleId of sample_ids) {
+      await query(
+        'UPDATE samples SET batch_id = $1, status = $2 WHERE id = $3',
+        [batchNumber, 'processing', sampleId]
+      );
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating batch:', error);
+    res.status(500).json({ error: 'Failed to create batch' });
+  }
+});
+
+// Test Results routes (NEW)
+app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { test_type, result, value, units, detection_limit, method, notes } = req.body;
+    
+    const resultData = await query(
+      `INSERT INTO test_results (sample_id, test_type, result, value, units, detection_limit, method, analyst, notes) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [id, test_type, result, value, units, detection_limit, method, req.user.username, notes]
+    );
+    
+    // Update sample status to complete
+    await query(
+      'UPDATE samples SET status = $1, completed_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['complete', id]
+    );
+    
+    res.json(resultData.rows[0]);
+  } catch (error) {
+    console.error('Error adding test result:', error);
+    res.status(500).json({ error: 'Failed to add test result' });
+  }
+});
+
+app.get('/api/samples/:id/results', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await query(
+      'SELECT * FROM test_results WHERE sample_id = $1 ORDER BY analyzed_at DESC',
+      [id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching test results:', error);
+    res.status(500).json({ error: 'Failed to fetch test results' });
+  }
+});
+
+// Dashboard stats
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
-    const [stats] = await pool.execute(`
-      SELECT 
-        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_orders,
-        COUNT(CASE WHEN status = 'shipped' THEN 1 END) as shipped_orders,
-        COUNT(CASE WHEN status = 'processing' THEN 1 END) as processing_orders,
-        COUNT(CASE WHEN status = 'complete' THEN 1 END) as complete_orders,
-        COUNT(*) as total_orders
-      FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-    `);
-
-    res.json(stats[0]);
+    const [orders, samples, batches] = await Promise.all([
+      query('SELECT status, COUNT(*) as count FROM orders GROUP BY status'),
+      query('SELECT status, COUNT(*) as count FROM samples GROUP BY status'),
+      query('SELECT status, COUNT(*) as count FROM batches GROUP BY status')
+    ]);
+    
+    const stats = {
+      pending_orders: 0,
+      shipped_orders: 0,
+      processing_orders: 0,
+      complete_orders: 0,
+      pending_samples: 0,
+      received_samples: 0,
+      processing_samples: 0,
+      complete_samples: 0,
+      active_batches: 0,
+      complete_batches: 0
+    };
+    
+    orders.rows.forEach(row => {
+      stats[`${row.status}_orders`] = parseInt(row.count);
+    });
+    
+    samples.rows.forEach(row => {
+      stats[`${row.status}_samples`] = parseInt(row.count);
+    });
+    
+    batches.rows.forEach(row => {
+      if (row.status === 'complete') {
+        stats.complete_batches = parseInt(row.count);
+      } else {
+        stats.active_batches += parseInt(row.count);
+      }
+    });
+    
+    res.json(stats);
   } catch (error) {
     console.error('Error fetching dashboard stats:', error);
-    res.status(500).json({ error: 'Failed to fetch stats' });
+    res.status(500).json({ error: 'Failed to fetch dashboard stats' });
   }
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`🚀 3R Testing LIMS Server running on port ${PORT}`);
+app.listen(PORT, async () => {
+  console.log(`3R Testing LIMS Server running on port ${PORT}`);
+  console.log(`Database type: PostgreSQL`);
+  
+  try {
+    await initializeDatabase();
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+    process.exit(1);
+  }
 });
 
 module.exports = app;
