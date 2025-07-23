@@ -55,7 +55,7 @@ app.use((req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(🚀 3R Testing LIMS Server running on port );
+  console.log('3R Testing LIMS Server running on port ' + PORT);
 });
 
 module.exports = app;
