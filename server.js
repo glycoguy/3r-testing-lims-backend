@@ -1,11 +1,14 @@
-// Enhanced server.js - Full LIMS Backend for 3R Testing
+// server.js - Main Express server
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const mysql = require('mysql2/promise');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs').promises;
 require('dotenv').config();
 
 const app = express();
@@ -13,11 +16,21 @@ const PORT = process.env.PORT || 3001;
 
 // Middleware
 app.use(helmet());
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// File upload setup
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// File upload configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/');
@@ -28,144 +41,31 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Create uploads directory if it doesn't exist
-const fs = require('fs');
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
-}
-
-// Database connection - Works with PostgreSQL or MySQL
+// Database connection
 const dbConfig = {
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 5432,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'lims_3r_testing',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 };
 
-// Use pg for PostgreSQL (Render's default) or mysql2 for MySQL
-let pool;
-const isPostgreSQL = process.env.DATABASE_URL || process.env.DB_PORT == 5432;
+const pool = mysql.createPool(dbConfig);
 
-if (isPostgreSQL) {
-  const { Pool } = require('pg');
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+// Test database connection
+pool.getConnection()
+  .then(connection => {
+    console.log('✅ Database connected successfully');
+    connection.release();
+  })
+  .catch(err => {
+    console.error('❌ Database connection failed:', err);
+    process.exit(1);
   });
-} else {
-  pool = mysql.createPool(dbConfig);
-}
 
-// Database query wrapper to handle both PostgreSQL and MySQL
-async function query(sql, params = []) {
-  if (isPostgreSQL) {
-    // Convert MySQL-style ? placeholders to PostgreSQL $1, $2, etc.
-    let paramIndex = 1;
-    const pgSql = sql.replace(/\?/g, () => `$${paramIndex++}`);
-    const result = await pool.query(pgSql, params);
-    return result.rows;
-  } else {
-    const [rows] = await pool.execute(sql, params);
-    return rows;
-  }
-}
-
-// Initialize database tables
-async function initializeDatabase() {
-  try {
-    console.log('Initializing database tables...');
-    
-    // Users table
-    await query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id ${isPostgreSQL ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY'},
-        username VARCHAR(50) NOT NULL UNIQUE,
-        email VARCHAR(100) NOT NULL UNIQUE,
-        password_hash VARCHAR(255),
-        first_name VARCHAR(50),
-        last_name VARCHAR(50),
-        role VARCHAR(20) DEFAULT 'technician',
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'},
-        updated_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'}
-      )
-    `);
-
-    // Customers table
-    await query(`
-      CREATE TABLE IF NOT EXISTS customers (
-        id ${isPostgreSQL ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY'},
-        name VARCHAR(100) NOT NULL,
-        email VARCHAR(100) NOT NULL,
-        company_name VARCHAR(100),
-        phone VARCHAR(20),
-        shipping_address TEXT,
-        billing_address TEXT,
-        notes TEXT,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'},
-        updated_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'}
-      )
-    `);
-
-    // Orders table
-    await query(`
-      CREATE TABLE IF NOT EXISTS orders (
-        id ${isPostgreSQL ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY'},
-        order_number VARCHAR(20) UNIQUE,
-        customer_id INTEGER REFERENCES customers(id),
-        sample_count INTEGER NOT NULL DEFAULT 0,
-        status VARCHAR(30) DEFAULT 'pending',
-        shipping_method VARCHAR(50) DEFAULT 'ups_ground',
-        tracking_number VARCHAR(100),
-        notes TEXT,
-        priority VARCHAR(20) DEFAULT 'normal',
-        created_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'},
-        shipped_at TIMESTAMP NULL,
-        delivered_at TIMESTAMP NULL,
-        received_at TIMESTAMP NULL,
-        completed_at TIMESTAMP NULL,
-        updated_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'}
-      )
-    `);
-
-    // Samples table
-    await query(`
-      CREATE TABLE IF NOT EXISTS samples (
-        id ${isPostgreSQL ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY'},
-        order_id INTEGER REFERENCES orders(id),
-        barcode VARCHAR(8) NOT NULL UNIQUE,
-        status VARCHAR(30) DEFAULT 'assigned',
-        well_position VARCHAR(10),
-        assigned_at ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'},
-        received_at TIMESTAMP NULL,
-        tested_at TIMESTAMP NULL,
-        notes TEXT
-      )
-    `);
-
-    // Results table
-    await query(`
-      CREATE TABLE IF NOT EXISTS results (
-        id ${isPostgreSQL ? 'SERIAL PRIMARY KEY' : 'INT AUTO_INCREMENT PRIMARY KEY'},
-        order_id INTEGER REFERENCES orders(id),
-        file_path VARCHAR(500),
-        file_name VARCHAR(255),
-        version INTEGER DEFAULT 1,
-        upload_date ${isPostgreSQL ? 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' : 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'},
-        notes TEXT
-      )
-    `);
-
-    console.log('✅ Database tables initialized successfully');
-  } catch (error) {
-    console.error('❌ Database initialization failed:', error);
-  }
-}
-
-// Auth middleware
+// Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -183,87 +83,40 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ==================
-// HEALTH & AUTH ROUTES
-// ==================
+// =====================
+// CUSTOMERS API ROUTES
+// =====================
 
-app.get('/api/health', async (req, res) => {
-  try {
-    // Test database connection
-    if (isPostgreSQL) {
-      await pool.query('SELECT 1');
-    } else {
-      await pool.execute('SELECT 1');
-    }
-    
-    res.json({ 
-      status: 'OK', 
-      timestamp: new Date().toISOString(),
-      message: '3R Testing LIMS Backend is running',
-      database: isPostgreSQL ? 'PostgreSQL' : 'MySQL'
-    });
-  } catch (error) {
-    res.status(503).json({ 
-      status: 'ERROR', 
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  
-  try {
-    // Default admin login
-    if (username === 'admin' && password === 'admin123') {
-      const token = jwt.sign(
-        { id: 1, username: 'admin', role: 'admin' },
-        process.env.JWT_SECRET || 'fallback_secret',
-        { expiresIn: '24h' }
-      );
-      
-      res.json({ 
-        token,
-        user: { id: 1, username: 'admin', role: 'admin' }
-      });
-    } else {
-      res.status(401).json({ error: 'Invalid credentials' });
-    }
-  } catch (error) {
-    res.status(500).json({ error: 'Login failed' });
-  }
-});
-
-// ==================
-// CUSTOMERS ROUTES
-// ==================
-
+// Get all customers
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
-    const customers = await query(`
+    const [rows] = await pool.execute(`
       SELECT c.*, 
-             COUNT(o.id) as total_orders
+             COUNT(o.id) as total_orders,
+             MAX(o.created_at) as last_order_date
       FROM customers c 
       LEFT JOIN orders o ON c.id = o.customer_id 
-      WHERE c.is_active = true
       GROUP BY c.id 
       ORDER BY c.created_at DESC
     `);
-    res.json(customers);
+    res.json(rows);
   } catch (error) {
     console.error('Error fetching customers:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
   }
 });
 
+// Create new customer
 app.post('/api/customers', authenticateToken, async (req, res) => {
-  const { name, email, company_name, phone, shipping_address, billing_address, notes } = req.body;
-  
+  const {
+    name, email, company_name, phone, 
+    shipping_address, billing_address, notes
+  } = req.body;
+
   try {
     // Check for duplicate customer
-    const existing = await query(
-      'SELECT id, name, email, company_name FROM customers WHERE email = ? OR (company_name = ? AND company_name IS NOT NULL)',
+    const [existing] = await pool.execute(
+      'SELECT id, name, email, company_name FROM customers WHERE email = ? OR company_name = ?',
       [email, company_name]
     );
 
@@ -274,16 +127,13 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       });
     }
 
-    const result = await query(`
+    const [result] = await pool.execute(`
       INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-      ${isPostgreSQL ? 'RETURNING id' : ''}
     `, [name, email, company_name, phone, shipping_address, billing_address, notes]);
 
-    const customerId = isPostgreSQL ? result[0].id : result.insertId;
-
     res.status(201).json({
-      id: customerId,
+      id: result.insertId,
       message: 'Customer created successfully'
     });
   } catch (error) {
@@ -293,19 +143,20 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
 });
 
 // ==================
-// ORDERS ROUTES
+// ORDERS API ROUTES
 // ==================
 
+// Get all orders with customer information
 app.get('/api/orders', authenticateToken, async (req, res) => {
   try {
-    const orders = await query(`
+    const [orders] = await pool.execute(`
       SELECT o.*, c.name as customer_name, c.email as customer_email, c.company_name,
              COUNT(s.id) as total_samples,
              COUNT(CASE WHEN s.status = 'received' THEN 1 END) as received_samples
       FROM orders o 
       LEFT JOIN customers c ON o.customer_id = c.id
       LEFT JOIN samples s ON o.id = s.order_id
-      GROUP BY o.id, c.id
+      GROUP BY o.id
       ORDER BY o.created_at DESC
     `);
     res.json(orders);
@@ -315,63 +166,90 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
   }
 });
 
+// Create new order (manual or from WooCommerce)
 app.post('/api/orders', authenticateToken, async (req, res) => {
-  const { customer_id, sample_count, shipping_method, notes, priority = 'normal' } = req.body;
+  const {
+    customer_id, woocommerce_order_id, sample_count, 
+    shipping_method, notes, source = 'manual'
+  } = req.body;
 
   try {
-    // Create order
-    const orderResult = await query(`
-      INSERT INTO orders (customer_id, sample_count, status, shipping_method, notes, priority)
-      VALUES (?, ?, 'pending', ?, ?, ?)
-      ${isPostgreSQL ? 'RETURNING id' : ''}
-    `, [customer_id, sample_count, shipping_method, notes, priority]);
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    const orderId = isPostgreSQL ? orderResult[0].id : orderResult.insertId;
+    try {
+      // Create order
+      const [orderResult] = await connection.execute(`
+        INSERT INTO orders (customer_id, woocommerce_order_id, sample_count, 
+                           status, shipping_method, notes, source)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?)
+      `, [customer_id, woocommerce_order_id, sample_count, shipping_method, notes, source]);
 
-    // Generate order number (format: year + sequential number)
-    const year = new Date().getFullYear();
-    const orderNumber = `${year}${orderId.toString().padStart(4, '0')}`;
-    
-    await query('UPDATE orders SET order_number = ? WHERE id = ?', [orderNumber, orderId]);
+      const orderId = orderResult.insertId;
 
-    res.status(201).json({
-      id: orderId,
-      order_number: orderNumber,
-      message: 'Order created successfully'
-    });
+      // Generate order number (format: year + sequential number)
+      const year = new Date().getFullYear();
+      const orderNumber = `${year}${orderId.toString().padStart(4, '0')}`;
+      
+      await connection.execute(
+        'UPDATE orders SET order_number = ? WHERE id = ?',
+        [orderNumber, orderId]
+      );
+
+      await connection.commit();
+      connection.release();
+
+      res.status(201).json({
+        id: orderId,
+        order_number: orderNumber,
+        message: 'Order created successfully'
+      });
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
   } catch (error) {
     console.error('Error creating order:', error);
     res.status(500).json({ error: 'Failed to create order' });
   }
 });
 
+// Update order status
 app.patch('/api/orders/:id/status', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { status, tracking_number, notes } = req.body;
 
   try {
-    let updateQuery = 'UPDATE orders SET status = ?';
-    let params = [status];
+    const updateFields = ['status = ?'];
+    const values = [status];
 
     if (tracking_number) {
-      updateQuery += ', tracking_number = ?';
-      params.push(tracking_number);
+      updateFields.push('tracking_number = ?');
+      values.push(tracking_number);
     }
 
     if (status === 'shipped') {
-      updateQuery += ', shipped_at = ' + (isPostgreSQL ? 'CURRENT_TIMESTAMP' : 'NOW()');
+      updateFields.push('shipped_at = NOW()');
     } else if (status === 'received_customer') {
-      updateQuery += ', delivered_at = ' + (isPostgreSQL ? 'CURRENT_TIMESTAMP' : 'NOW()');
+      updateFields.push('delivered_at = NOW()');
     } else if (status === 'processing') {
-      updateQuery += ', received_at = ' + (isPostgreSQL ? 'CURRENT_TIMESTAMP' : 'NOW()');
+      updateFields.push('received_at = NOW()');
     } else if (status === 'complete') {
-      updateQuery += ', completed_at = ' + (isPostgreSQL ? 'CURRENT_TIMESTAMP' : 'NOW()');
+      updateFields.push('completed_at = NOW()');
     }
 
-    updateQuery += ' WHERE id = ?';
-    params.push(id);
+    values.push(id);
 
-    await query(updateQuery, params);
+    await pool.execute(`
+      UPDATE orders SET ${updateFields.join(', ')} WHERE id = ?
+    `, values);
+
+    // Log status change
+    await pool.execute(`
+      INSERT INTO order_status_log (order_id, old_status, new_status, notes, changed_by)
+      VALUES (?, (SELECT status FROM orders WHERE id = ? LIMIT 1), ?, ?, ?)
+    `, [id, id, status, notes, req.user.id]);
 
     res.json({ message: 'Order status updated successfully' });
   } catch (error) {
@@ -380,43 +258,60 @@ app.patch('/api/orders/:id/status', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================
-// SAMPLES ROUTES
-// ==================
+// ===================
+// SAMPLES API ROUTES
+// ===================
 
+// Assign barcode to order
 app.post('/api/orders/:orderId/samples', authenticateToken, async (req, res) => {
   const { orderId } = req.params;
   const { barcodes } = req.body; // Array of barcode strings
 
   try {
-    for (const barcode of barcodes) {
-      // Check if barcode already exists
-      const existing = await query('SELECT id FROM samples WHERE barcode = ?', [barcode]);
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-      if (existing.length > 0) {
-        return res.status(400).json({ error: `Barcode ${barcode} already assigned` });
+    try {
+      for (const barcode of barcodes) {
+        // Check if barcode already exists
+        const [existing] = await connection.execute(
+          'SELECT id FROM samples WHERE barcode = ?',
+          [barcode]
+        );
+
+        if (existing.length > 0) {
+          throw new Error(`Barcode ${barcode} already assigned`);
+        }
+
+        // Insert sample
+        await connection.execute(`
+          INSERT INTO samples (order_id, barcode, status, created_by)
+          VALUES (?, ?, 'assigned', ?)
+        `, [orderId, barcode, req.user.id]);
       }
 
-      // Insert sample
-      await query(`
-        INSERT INTO samples (order_id, barcode, status)
-        VALUES (?, ?, 'assigned')
-      `, [orderId, barcode]);
-    }
+      await connection.commit();
+      connection.release();
 
-    res.json({ message: 'Barcodes assigned successfully' });
+      res.json({ message: 'Barcodes assigned successfully' });
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
   } catch (error) {
     console.error('Error assigning barcodes:', error);
-    res.status(500).json({ error: 'Failed to assign barcodes' });
+    res.status(500).json({ error: error.message || 'Failed to assign barcodes' });
   }
 });
 
+// Receive sample by barcode scan
 app.post('/api/samples/receive', authenticateToken, async (req, res) => {
   const { barcode } = req.body;
 
   try {
-    const samples = await query(`
-      SELECT s.*, o.order_number, c.name as customer_name
+    const [samples] = await pool.execute(`
+      SELECT s.*, o.order_number, o.customer_id, c.name as customer_name
       FROM samples s
       JOIN orders o ON s.order_id = o.id
       JOIN customers c ON o.customer_id = c.id
@@ -430,8 +325,8 @@ app.post('/api/samples/receive', authenticateToken, async (req, res) => {
     const sample = samples[0];
 
     // Update sample status
-    await query(
-      'UPDATE samples SET status = ?, received_at = ' + (isPostgreSQL ? 'CURRENT_TIMESTAMP' : 'NOW()') + ' WHERE barcode = ?',
+    await pool.execute(
+      'UPDATE samples SET status = ?, received_at = NOW() WHERE barcode = ?',
       ['received', barcode]
     );
 
@@ -445,13 +340,223 @@ app.post('/api/samples/receive', authenticateToken, async (req, res) => {
   }
 });
 
+// Generate Excel export for batch processing
+app.get('/api/samples/export/:orderId', authenticateToken, async (req, res) => {
+  const { orderId } = req.params;
+
+  try {
+    const [samples] = await pool.execute(`
+      SELECT s.barcode, s.status, o.order_number
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      WHERE s.order_id = ? AND s.status = 'received'
+      ORDER BY s.created_at
+      LIMIT 92
+    `, [orderId]);
+
+    // Generate Excel-compatible data structure
+    const excelData = samples.map((sample, index) => ({
+      well_position: `${String.fromCharCode(65 + Math.floor(index / 12))}${(index % 12) + 1}`,
+      barcode: sample.barcode,
+      order_number: sample.order_number,
+      sample_id: sample.barcode
+    }));
+
+    res.json({
+      data: excelData,
+      total_samples: samples.length,
+      max_samples: 92
+    });
+  } catch (error) {
+    console.error('Error generating export:', error);
+    res.status(500).json({ error: 'Failed to generate export' });
+  }
+});
+
 // ==================
-// DASHBOARD STATS
+// RESULTS API ROUTES
 // ==================
 
+// Upload results file
+app.post('/api/orders/:orderId/results', authenticateToken, upload.single('results'), async (req, res) => {
+  const { orderId } = req.params;
+  const { notes, version } = req.body;
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  try {
+    const [result] = await pool.execute(`
+      INSERT INTO results (order_id, file_path, file_name, file_size, 
+                          version, notes, uploaded_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [
+      orderId, 
+      req.file.path, 
+      req.file.originalname, 
+      req.file.size,
+      version || 1,
+      notes,
+      req.user.id
+    ]);
+
+    // Update order status to results_pending
+    await pool.execute(
+      'UPDATE orders SET status = ? WHERE id = ?',
+      ['results_pending', orderId]
+    );
+
+    res.json({
+      id: result.insertId,
+      message: 'Results uploaded successfully'
+    });
+  } catch (error) {
+    console.error('Error uploading results:', error);
+    res.status(500).json({ error: 'Failed to upload results' });
+  }
+});
+
+// Send results via email
+app.post('/api/orders/:orderId/send-results', authenticateToken, async (req, res) => {
+  const { orderId } = req.params;
+  const { email_message, send_sms } = req.body;
+
+  try {
+    // Get order and customer details
+    const [orders] = await pool.execute(`
+      SELECT o.*, c.name, c.email, c.phone, r.file_path, r.file_name
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN results r ON o.id = r.order_id
+      WHERE o.id = ?
+      ORDER BY r.version DESC
+      LIMIT 1
+    `, [orderId]);
+
+    if (orders.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orders[0];
+
+    // TODO: Implement actual email sending (see email integration section)
+    console.log(`Sending results email to: ${order.email}`);
+    console.log(`Message: ${email_message}`);
+
+    if (send_sms && order.phone) {
+      // TODO: Implement SMS sending
+      console.log(`Sending SMS notification to: ${order.phone}`);
+    }
+
+    // Log email sent
+    await pool.execute(`
+      INSERT INTO email_log (order_id, recipient_email, subject, message, sent_by)
+      VALUES (?, ?, ?, ?, ?)
+    `, [orderId, order.email, `Test Results - Order ${order.order_number}`, email_message, req.user.id]);
+
+    // Update order status to complete
+    await pool.execute(
+      'UPDATE orders SET status = ?, completed_at = NOW() WHERE id = ?',
+      ['complete', orderId]
+    );
+
+    res.json({ message: 'Results sent successfully' });
+  } catch (error) {
+    console.error('Error sending results:', error);
+    res.status(500).json({ error: 'Failed to send results' });
+  }
+});
+
+// ==========================
+// WOOCOMMERCE WEBHOOK ROUTE
+// ==========================
+
+app.post('/api/webhooks/woocommerce', async (req, res) => {
+  try {
+    const orderData = req.body;
+    
+    // Verify webhook signature (implement based on WooCommerce settings)
+    // const signature = req.headers['x-wc-webhook-signature'];
+    
+    console.log('Received WooCommerce webhook:', orderData.id);
+
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Create or find customer
+      let customerId;
+      const [existingCustomer] = await connection.execute(
+        'SELECT id FROM customers WHERE email = ?',
+        [orderData.billing.email]
+      );
+
+      if (existingCustomer.length > 0) {
+        customerId = existingCustomer[0].id;
+      } else {
+        const [customerResult] = await connection.execute(`
+          INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `, [
+          `${orderData.billing.first_name} ${orderData.billing.last_name}`,
+          orderData.billing.email,
+          orderData.billing.company || '',
+          orderData.billing.phone || '',
+          `${orderData.shipping.address_1} ${orderData.shipping.address_2}, ${orderData.shipping.city}, ${orderData.shipping.state} ${orderData.shipping.postcode}`,
+          `${orderData.billing.address_1} ${orderData.billing.address_2}, ${orderData.billing.city}, ${orderData.billing.state} ${orderData.billing.postcode}`
+        ]);
+        customerId = customerResult.insertId;
+      }
+
+      // Calculate total sample count from line items
+      const sampleCount = orderData.line_items.reduce((total, item) => {
+        return total + item.quantity;
+      }, 0);
+
+      // Create order
+      const [orderResult] = await connection.execute(`
+        INSERT INTO orders (customer_id, woocommerce_order_id, sample_count, status, source)
+        VALUES (?, ?, ?, 'pending', 'woocommerce')
+      `, [customerId, orderData.id, sampleCount]);
+
+      const orderId = orderResult.insertId;
+      const year = new Date().getFullYear();
+      const orderNumber = `${year}${orderId.toString().padStart(4, '0')}`;
+      
+      await connection.execute(
+        'UPDATE orders SET order_number = ? WHERE id = ?',
+        [orderNumber, orderId]
+      );
+
+      await connection.commit();
+      connection.release();
+
+      res.json({ message: 'Order created from WooCommerce', order_id: orderId });
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
+  } catch (error) {
+    console.error('Error processing WooCommerce webhook:', error);
+    res.status(500).json({ error: 'Failed to process webhook' });
+  }
+});
+
+// ===============
+// UTILITY ROUTES
+// ===============
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Get dashboard statistics
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
-    const stats = await query(`
+    const [stats] = await pool.execute(`
       SELECT 
         COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_orders,
         COUNT(CASE WHEN status = 'shipped' THEN 1 END) as shipped_orders,
@@ -459,23 +564,17 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
         COUNT(CASE WHEN status = 'complete' THEN 1 END) as complete_orders,
         COUNT(*) as total_orders
       FROM orders
-      WHERE created_at >= ${isPostgreSQL ? "CURRENT_DATE - INTERVAL '30 days'" : 'DATE_SUB(NOW(), INTERVAL 30 DAY)'}
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
     `);
 
-    res.json(stats[0] || {
-      pending_orders: 0,
-      shipped_orders: 0, 
-      processing_orders: 0,
-      complete_orders: 0,
-      total_orders: 0
-    });
+    res.json(stats[0]);
   } catch (error) {
     console.error('Error fetching dashboard stats:', error);
     res.status(500).json({ error: 'Failed to fetch stats' });
   }
 });
 
-// Error handling
+// Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({ error: 'Internal server error' });
@@ -486,12 +585,9 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// Initialize database and start server
-initializeDatabase().then(() => {
-  app.listen(PORT, () => {
-    console.log('3R Testing LIMS Server running on port ' + PORT);
-    console.log('Database type: ' + (isPostgreSQL ? 'PostgreSQL' : 'MySQL'));
-  });
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 3R Testing LIMS Server running on port ${PORT}`);
 });
 
 module.exports = app;
