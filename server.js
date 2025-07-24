@@ -498,6 +498,10 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { username, password, role, email, full_name } = req.body;
     
+    if (!username || !password || !role || !email) {
+      return res.status(400).json({ error: 'Username, password, role, and email are required' });
+    }
+    
     const hashedPassword = await bcrypt.hash(password, 10);
     
     // Check if full_name and created_by columns exist
@@ -510,7 +514,7 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
     
     if (fullNameExists) {
       insertQuery += ', full_name';
-      values.push(full_name);
+      values.push(full_name || username);
       paramCount++;
     }
     
@@ -580,6 +584,10 @@ app.patch('/api/users/:id/toggle', authenticateToken, requireAdmin, async (req, 
 app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
+    
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current password and new password are required' });
+    }
     
     // Get current user
     const userResult = await query('SELECT * FROM users WHERE id = $1', [req.user.userId]);
@@ -729,8 +737,21 @@ app.post('/api/backup/create', authenticateToken, requireAdmin, async (req, res)
   }
 });
 
-// Continue with existing routes (customers, orders, samples, etc.) with enhanced audit logging...
-// [Previous route implementations remain the same, but with enhanced audit logging]
+app.get('/api/backup/list', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT db.*, u.username as created_by_name
+      FROM database_backups db
+      LEFT JOIN users u ON db.created_by = u.id
+      ORDER BY db.created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching backups:', error);
+    res.status(500).json({ error: 'Failed to fetch backups' });
+  }
+});
 
 // Customer routes
 app.get('/api/customers', authenticateToken, async (req, res) => {
@@ -768,6 +789,10 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
   try {
     const { name, email, company_name, phone, shipping_address, billing_address, notes } = req.body;
     
+    if (!name || !email) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+    
     const createdByExists = await columnExists('customers', 'created_by');
     
     let insertQuery = `
@@ -804,11 +829,267 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
   }
 });
 
-// Continue with other existing routes...
-// (For brevity, I'll include the essential remaining routes in a shortened form)
+// Order routes
+app.get('/api/orders', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT o.*, c.name as customer_name, c.email as customer_email, c.company_name,
+             COUNT(s.id) as received_samples, u.username as created_by_name
+      FROM orders o 
+      JOIN customers c ON o.customer_id = c.id 
+      LEFT JOIN samples s ON o.id = s.order_id AND s.status != 'pending'
+      LEFT JOIN users u ON o.created_by = u.id
+      GROUP BY o.id, c.name, c.email, c.company_name, u.username
+      ORDER BY o.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching orders:', error);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
 
-// Orders, Samples, Batches, Test Results routes would follow the same pattern
-// with migration-safe column checking and enhanced audit logging
+app.post('/api/orders', authenticateToken, async (req, res) => {
+  try {
+    const { customer_id, sample_count, shipping_method, priority, notes } = req.body;
+    
+    if (!customer_id || !sample_count) {
+      return res.status(400).json({ error: 'Customer ID and sample count are required' });
+    }
+    
+    // Generate order number
+    const orderNumber = 'ORD-' + Date.now();
+    
+    const result = await query(
+      `INSERT INTO orders (customer_id, order_number, sample_count, shipping_method, priority, notes, created_by) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [customer_id, orderNumber, sample_count, shipping_method, priority, notes, req.user.userId]
+    );
+    
+    // Generate sample barcodes for this order
+    const order = result.rows[0];
+    for (let i = 1; i <= sample_count; i++) {
+      const barcode = `${orderNumber}-S${i.toString().padStart(2, '0')}`;
+      await query(
+        'INSERT INTO samples (order_id, barcode) VALUES ($1, $2)',
+        [order.id, barcode]
+      );
+    }
+    
+    // Log audit
+    await logAudit(req.user.userId, 'CREATE', 'order', order.id, `Created order: ${orderNumber} (${sample_count} samples)`);
+    
+    res.json(order);
+  } catch (error) {
+    console.error('Error creating order:', error);
+    res.status(500).json({ error: 'Failed to create order' });
+  }
+});
+
+// Sample routes
+app.get('/api/samples', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name, c.company_name,
+             COUNT(tr.id) as test_count,
+             rb.username as received_by_name,
+             pb.username as processed_by_name
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN test_results tr ON s.id = tr.sample_id
+      LEFT JOIN users rb ON s.received_by = rb.id
+      LEFT JOIN users pb ON s.processed_by = pb.id
+      GROUP BY s.id, o.order_number, c.name, c.company_name, rb.username, pb.username
+      ORDER BY s.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching samples:', error);
+    res.status(500).json({ error: 'Failed to fetch samples' });
+  }
+});
+
+app.post('/api/samples/receive', authenticateToken, async (req, res) => {
+  try {
+    const { barcode, location = 'Main Lab', notes = '' } = req.body;
+    
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode is required' });
+    }
+    
+    const result = await query(
+      `UPDATE samples 
+       SET status = 'received', received_at = CURRENT_TIMESTAMP, location = $2, notes = $3, received_by = $4
+       WHERE barcode = $1 
+       RETURNING *`,
+      [barcode, location, notes, req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+    
+    // Get customer info
+    const sampleInfo = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      JOIN customers c ON o.customer_id = c.id
+      WHERE s.id = $1
+    `, [result.rows[0].id]);
+    
+    // Log audit
+    await logAudit(req.user.userId, 'UPDATE', 'sample', result.rows[0].id, `Sample received: ${barcode}`);
+    
+    res.json({ 
+      message: 'Sample received successfully',
+      sample: sampleInfo.rows[0]
+    });
+  } catch (error) {
+    console.error('Error receiving sample:', error);
+    res.status(500).json({ error: 'Failed to receive sample' });
+  }
+});
+
+app.patch('/api/samples/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, batch_id, notes } = req.body;
+    
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+    
+    let updateQuery = 'UPDATE samples SET status = $1';
+    let params = [status];
+    let paramCount = 1;
+    
+    if (status === 'processing') {
+      updateQuery += ', processed_at = CURRENT_TIMESTAMP, processed_by = $2';
+      params.push(req.user.userId);
+      paramCount = 2;
+    } else if (status === 'complete') {
+      updateQuery += ', completed_at = CURRENT_TIMESTAMP';
+    }
+    
+    if (batch_id) {
+      paramCount++;
+      updateQuery += `, batch_id = $${paramCount}`;
+      params.push(batch_id);
+    }
+    
+    if (notes) {
+      paramCount++;
+      updateQuery += `, notes = $${paramCount}`;
+      params.push(notes);
+    }
+    
+    paramCount++;
+    updateQuery += ` WHERE id = $${paramCount} RETURNING *`;
+    params.push(id);
+    
+    const result = await query(updateQuery, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+    
+    // Log audit
+    await logAudit(req.user.userId, 'UPDATE', 'sample', id, `Sample status changed to: ${status}`);
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error updating sample status:', error);
+    res.status(500).json({ error: 'Failed to update sample status' });
+  }
+});
+
+// Batch routes
+app.get('/api/batches', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT b.*, u.username as created_by_name,
+             COUNT(s.id) as actual_sample_count
+      FROM batches b
+      LEFT JOIN users u ON b.created_by = u.id
+      LEFT JOIN samples s ON s.batch_id = b.batch_number
+      GROUP BY b.id, u.username
+      ORDER BY b.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching batches:', error);
+    res.status(500).json({ error: 'Failed to fetch batches' });
+  }
+});
+
+app.post('/api/batches', authenticateToken, async (req, res) => {
+  try {
+    const { test_type, sample_ids, notes } = req.body;
+    
+    if (!test_type || !sample_ids || sample_ids.length === 0) {
+      return res.status(400).json({ error: 'Test type and sample IDs are required' });
+    }
+    
+    // Generate batch number
+    const batchNumber = 'BATCH-' + Date.now();
+    
+    const result = await query(
+      `INSERT INTO batches (batch_number, test_type, created_by, sample_count, notes) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [batchNumber, test_type, req.user.userId, sample_ids.length, notes]
+    );
+    
+    // Update samples with batch ID
+    for (const sampleId of sample_ids) {
+      await query(
+        'UPDATE samples SET batch_id = $1, status = $2, processed_by = $3 WHERE id = $4',
+        [batchNumber, 'processing', req.user.userId, sampleId]
+      );
+    }
+    
+    // Log audit
+    await logAudit(req.user.userId, 'CREATE', 'batch', result.rows[0].id, `Created batch: ${batchNumber} (${sample_ids.length} samples)`);
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating batch:', error);
+    res.status(500).json({ error: 'Failed to create batch' });
+  }
+});
+
+// Test Results routes
+app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { test_type, result, value, units, detection_limit, method, notes } = req.body;
+    
+    if (!test_type || !result) {
+      return res.status(400).json({ error: 'Test type and result are required' });
+    }
+    
+    const resultData = await query(
+      `INSERT INTO test_results (sample_id, test_type, result, value, units, detection_limit, method, analyst_id, notes) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [id, test_type, result, value, units, detection_limit, method, req.user.userId, notes]
+    );
+    
+    // Update sample status to complete
+    await query(
+      'UPDATE samples SET status = $1, completed_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['complete', id]
+    );
+    
+    // Log audit
+    await logAudit(req.user.userId, 'CREATE', 'test_result', resultData.rows[0].id, `Added ${test_type} result: ${result}`);
+    
+    res.json(resultData.rows[0]);
+  } catch (error) {
+    console.error('Error adding test result:', error);
+    res.status(500).json({ error: 'Failed to add test result' });
+  }
+});
 
 // Dashboard stats
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
@@ -876,9 +1157,6 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch dashboard stats' });
   }
 });
-
-// Add remaining essential routes (orders, samples, batches) with the same migration-safe approach...
-// (I'll add these if you need them, but the key fix is the migration-safe database initialization)
 
 // Start server
 app.listen(PORT, async () => {
