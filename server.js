@@ -3,6 +3,10 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const nodemailer = require('nodemailer');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,6 +15,17 @@ const PORT = process.env.PORT || 3001;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Email configuration
+const emailTransporter = nodemailer.createTransporter({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: process.env.SMTP_PORT || 587,
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER || 'your-email@gmail.com',
+    pass: process.env.SMTP_PASS || 'your-app-password'
+  }
 });
 
 // Middleware
@@ -63,7 +78,6 @@ async function query(text, params) {
 // Safe audit logging function
 const logAudit = async (userId, action, entityType, entityId, details = null) => {
   try {
-    // Check if audit_log table exists
     const tableExists = await query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -98,12 +112,176 @@ const columnExists = async (tableName, columnName) => {
   }
 };
 
-// Initialize database tables with migrations
+// Email notification functions
+const sendResultsReadyEmail = async (customerEmail, customerName, orderNumber, pdfBuffer = null) => {
+  try {
+    const subject = `3R Testing - Results Ready for Order ${orderNumber}`;
+    
+    const html = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background-color: #059669; color: white; padding: 20px; text-align: center;">
+          <h1>3R Testing Laboratory</h1>
+          <p>Test Results Ready</p>
+        </div>
+        
+        <div style="padding: 30px; background-color: #f9fafb;">
+          <h2>Your Test Results Are Ready!</h2>
+          <p>Dear ${customerName},</p>
+          
+          <div style="background-color: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3>Order: ${orderNumber}</h3>
+            <p>We're pleased to inform you that your test results are now available.</p>
+            <p>Please find your detailed test report attached to this email.</p>
+          </div>
+          
+          <div style="background-color: #ecfccb; padding: 15px; border-radius: 8px; border-left: 4px solid #65a30d;">
+            <p><strong>Next Steps:</strong></p>
+            <ul>
+              <li>Review your test results in the attached PDF report</li>
+              <li>Log into your customer portal to view additional details</li>
+              <li>Contact us if you have any questions about your results</li>
+            </ul>
+          </div>
+          
+          <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+            <p style="color: #6b7280; font-size: 14px;">
+              Questions about your results? Contact our lab team:<br>
+              Email: lab@3rtesting.com<br>
+              Phone: (555) 123-4567
+            </p>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const mailOptions = {
+      from: process.env.SMTP_FROM || '"3R Testing Lab" <results@3rtesting.com>',
+      to: customerEmail,
+      subject: subject,
+      html: html
+    };
+
+    if (pdfBuffer) {
+      mailOptions.attachments = [{
+        filename: `3R_Testing_Results_${orderNumber}.pdf`,
+        content: pdfBuffer,
+        contentType: 'application/pdf'
+      }];
+    }
+
+    await emailTransporter.sendMail(mailOptions);
+    console.log(`Results email sent to ${customerEmail} for order ${orderNumber}`);
+    return true;
+  } catch (error) {
+    console.error('Results email sending failed:', error);
+    return false;
+  }
+};
+
+// PDF generation function
+const generateTestResultsPDF = async (orderData, samplesData, resultsData) => {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument();
+      const buffers = [];
+      
+      doc.on('data', buffers.push.bind(buffers));
+      doc.on('end', () => {
+        const pdfBuffer = Buffer.concat(buffers);
+        resolve(pdfBuffer);
+      });
+
+      // Header
+      doc.fontSize(20).fillColor('#2563eb').text('3R Testing Laboratory', 50, 50);
+      doc.fontSize(12).fillColor('#6b7280').text('Plant Pathology Testing Services', 50, 75);
+      doc.fontSize(10).text('123 Lab Street, Science City, SC 12345', 50, 90);
+      doc.text('Phone: (555) 123-4567 | Email: lab@3rtesting.com', 50, 105);
+
+      // Line separator
+      doc.moveTo(50, 130).lineTo(550, 130).stroke();
+
+      // Report title
+      doc.fontSize(16).fillColor('#000').text('TEST RESULTS REPORT', 50, 150);
+      
+      // Order information
+      doc.fontSize(12).text(`Order Number: ${orderData.order_number}`, 50, 180);
+      doc.text(`Customer: ${orderData.customer_name}`, 50, 200);
+      doc.text(`Company: ${orderData.company_name || 'N/A'}`, 50, 220);
+      doc.text(`Report Date: ${new Date().toLocaleDateString()}`, 50, 240);
+
+      // Sample information
+      let yPosition = 280;
+      doc.fontSize(14).text('SAMPLE RESULTS', 50, yPosition);
+      yPosition += 30;
+
+      samplesData.forEach((sample, index) => {
+        if (yPosition > 700) {
+          doc.addPage();
+          yPosition = 50;
+        }
+
+        doc.fontSize(12).fillColor('#1f2937').text(`Sample ${index + 1}: ${sample.barcode}`, 50, yPosition);
+        yPosition += 20;
+        
+        doc.fontSize(10).fillColor('#6b7280').text(`Status: ${sample.status}`, 70, yPosition);
+        doc.text(`Received: ${sample.received_at ? new Date(sample.received_at).toLocaleDateString() : 'N/A'}`, 70, yPosition + 12);
+        doc.text(`Completed: ${sample.completed_at ? new Date(sample.completed_at).toLocaleDateString() : 'N/A'}`, 70, yPosition + 24);
+        yPosition += 50;
+
+        // Test results for this sample
+        const sampleResults = resultsData.filter(r => r.sample_id === sample.id);
+        if (sampleResults.length > 0) {
+          doc.fontSize(11).fillColor('#374151').text('Test Results:', 70, yPosition);
+          yPosition += 20;
+
+          sampleResults.forEach(result => {
+            doc.fontSize(10).fillColor('#000');
+            doc.text(`• ${result.test_type}: ${result.result}`, 90, yPosition);
+            if (result.value) {
+              doc.text(`  Value: ${result.value} ${result.units || ''}`, 90, yPosition + 12);
+            }
+            if (result.method) {
+              doc.text(`  Method: ${result.method}`, 90, yPosition + 24);
+            }
+            yPosition += 40;
+          });
+        } else {
+          doc.fontSize(10).fillColor('#ef4444').text('No test results available', 70, yPosition);
+          yPosition += 20;
+        }
+
+        yPosition += 20;
+      });
+
+      // Footer
+      if (yPosition > 650) {
+        doc.addPage();
+        yPosition = 50;
+      }
+
+      doc.fontSize(8).fillColor('#6b7280').text(
+        'This report contains confidential information. Results are valid only for the samples tested.',
+        50, yPosition + 50
+      );
+      
+      doc.text(
+        `Report generated on ${new Date().toLocaleString()} by 3R Testing Laboratory`,
+        50, yPosition + 65
+      );
+
+      doc.end();
+    } catch (error) {
+      reject(error);
+    }
+  });
+};
+
+// Initialize database tables (same as before with migration-safe approach)
 async function initializeDatabase() {
   try {
     console.log('Initializing database tables...');
     
-    // Step 1: Create basic users table if it doesn't exist
+    // Create basic users table if it doesn't exist
     await query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -115,7 +293,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // Step 2: Add new columns to users table if they don't exist
+    // Add new columns to users table if they don't exist
     const userColumns = [
       { name: 'full_name', type: 'VARCHAR(100)' },
       { name: 'is_active', type: 'BOOLEAN DEFAULT true' },
@@ -133,7 +311,7 @@ async function initializeDatabase() {
       }
     }
 
-    // Step 3: Create audit log table
+    // Create audit log table
     await query(`
       CREATE TABLE IF NOT EXISTS audit_log (
         id SERIAL PRIMARY KEY,
@@ -147,7 +325,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // Step 4: Create other new tables
+    // Create other tables
     await query(`
       CREATE TABLE IF NOT EXISTS database_backups (
         id SERIAL PRIMARY KEY,
@@ -172,7 +350,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Step 5: Create existing tables with enhancements
     await query(`
       CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -187,7 +364,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Add created_by to customers if it doesn't exist
     const customerCreatedByExists = await columnExists('customers', 'created_by');
     if (!customerCreatedByExists) {
       await query('ALTER TABLE customers ADD COLUMN created_by INTEGER REFERENCES users(id)');
@@ -210,7 +386,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Add created_by to orders if it doesn't exist
     const orderCreatedByExists = await columnExists('orders', 'created_by');
     if (!orderCreatedByExists) {
       await query('ALTER TABLE orders ADD COLUMN created_by INTEGER REFERENCES users(id)');
@@ -233,7 +408,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Add user tracking to samples if it doesn't exist
     const sampleUserCols = ['received_by', 'processed_by'];
     for (const col of sampleUserCols) {
       const exists = await columnExists('samples', col);
@@ -258,7 +432,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Add analyst_id to test_results if it doesn't exist
     const analystIdExists = await columnExists('test_results', 'analyst_id');
     if (!analystIdExists) {
       await query('ALTER TABLE test_results ADD COLUMN analyst_id INTEGER REFERENCES users(id)');
@@ -294,13 +467,55 @@ async function initializeDatabase() {
       )
     `);
 
-    // Add tested_by to quality_control if it doesn't exist
     const testedByExists = await columnExists('quality_control', 'tested_by');
     if (!testedByExists) {
       await query('ALTER TABLE quality_control ADD COLUMN tested_by INTEGER REFERENCES users(id)');
     }
 
-    // Step 6: Check if admin user exists, create if not
+    // Email notifications table
+    await query(`
+      CREATE TABLE IF NOT EXISTS email_notifications (
+        id SERIAL PRIMARY KEY,
+        recipient_email VARCHAR(100) NOT NULL,
+        recipient_name VARCHAR(100),
+        subject VARCHAR(200) NOT NULL,
+        order_id INTEGER REFERENCES orders(id),
+        notification_type VARCHAR(50),
+        status VARCHAR(20) DEFAULT 'pending',
+        sent_at TIMESTAMP,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_by INTEGER REFERENCES users(id)
+      )
+    `);
+
+    // PDF reports table
+    await query(`
+      CREATE TABLE IF NOT EXISTS pdf_reports (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER REFERENCES orders(id),
+        report_type VARCHAR(50) DEFAULT 'test_results',
+        filename VARCHAR(200),
+        file_size INTEGER,
+        generated_by INTEGER REFERENCES users(id),
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        download_count INTEGER DEFAULT 0
+      )
+    `);
+
+    // Customer portal access table
+    await query(`
+      CREATE TABLE IF NOT EXISTS customer_portal_access (
+        id SERIAL PRIMARY KEY,
+        customer_id INTEGER REFERENCES customers(id),
+        access_token VARCHAR(255) UNIQUE,
+        expires_at TIMESTAMP,
+        last_accessed TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Check if admin user exists, create if not
     const adminCheck = await query('SELECT * FROM users WHERE username = $1', ['admin']);
     if (adminCheck.rows.length === 0) {
       const hashedPassword = await bcrypt.hash('admin123', 10);
@@ -309,11 +524,8 @@ async function initializeDatabase() {
         ['admin', hashedPassword, 'admin', 'admin@3rtesting.com', 'System Administrator']
       );
       console.log('Admin user created');
-      
-      // Log admin creation if audit table exists
       await logAudit(adminResult.rows[0].id, 'CREATE', 'user', adminResult.rows[0].id, 'System admin user created');
     } else {
-      // Update existing admin user with full_name if it's null
       const fullNameExists = await columnExists('users', 'full_name');
       if (fullNameExists) {
         await query(
@@ -323,7 +535,6 @@ async function initializeDatabase() {
       }
     }
 
-    // Create default technician if not exists
     const techCheck = await query('SELECT * FROM users WHERE username = $1', ['technician']);
     if (techCheck.rows.length === 0) {
       const hashedPassword = await bcrypt.hash('tech123', 10);
@@ -332,9 +543,7 @@ async function initializeDatabase() {
         ['technician', hashedPassword, 'technician', 'tech@3rtesting.com', 'Lab Technician', 1]
       );
       console.log('Default technician user created');
-      await logAudit(1, 'CREATE', 'user', techResult.rows[0].id, 'Default technician user created');
     } else {
-      // Update existing technician with full_name if it's null
       const fullNameExists = await columnExists('users', 'full_name');
       if (fullNameExists) {
         await query(
@@ -360,7 +569,8 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     message: '3R Testing LIMS Backend is running',
     database: 'PostgreSQL',
-    version: '2.0.0'
+    version: '2.1.0 - Communication & Notifications',
+    features: ['email_notifications', 'pdf_reports', 'customer_portal']
   });
 });
 
@@ -377,7 +587,6 @@ app.post('/api/auth/login', async (req, res) => {
     
     const user = result.rows[0];
     
-    // Check if user is active (if column exists)
     const isActiveExists = await columnExists('users', 'is_active');
     if (isActiveExists && user.is_active === false) {
       return res.status(401).json({ error: 'Account is disabled' });
@@ -389,13 +598,11 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    // Update last login if column exists
     const lastLoginExists = await columnExists('users', 'last_login');
     if (lastLoginExists) {
       await query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
     }
     
-    // Log session if table exists
     const sessionTableExists = await query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -410,7 +617,6 @@ app.post('/api/auth/login', async (req, res) => {
       );
     }
     
-    // Log audit
     await logAudit(user.id, 'LOGIN', 'session', null, `User ${username} logged in`);
     
     const token = jwt.sign(
@@ -437,7 +643,6 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   try {
-    // Log session if table exists
     const sessionTableExists = await query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -452,7 +657,6 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
       );
     }
     
-    // Log audit
     await logAudit(req.user.userId, 'LOGOUT', 'session', null, `User ${req.user.username} logged out`);
     
     res.json({ message: 'Logged out successfully' });
@@ -468,7 +672,6 @@ app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
     let userQuery = 'SELECT u.* FROM users u ORDER BY u.created_at DESC';
     let queryParams = [];
     
-    // Check if created_by column exists to include creator info
     const createdByExists = await columnExists('users', 'created_by');
     if (createdByExists) {
       userQuery = `
@@ -481,7 +684,6 @@ app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
     
     const result = await query(userQuery, queryParams);
     
-    // Remove password hashes from response
     const users = result.rows.map(user => {
       const { password_hash, ...userWithoutPassword } = user;
       return userWithoutPassword;
@@ -504,7 +706,6 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
     
     const hashedPassword = await bcrypt.hash(password, 10);
     
-    // Check if full_name and created_by columns exist
     const fullNameExists = await columnExists('users', 'full_name');
     const createdByExists = await columnExists('users', 'created_by');
     
@@ -533,10 +734,8 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
     const result = await query(insertQuery, values);
     const newUser = result.rows[0];
     
-    // Log audit
     await logAudit(req.user.userId, 'CREATE', 'user', newUser.id, `Created user: ${username} (${role})`);
     
-    // Remove password hash from response
     const { password_hash, ...userWithoutPassword } = newUser;
     res.json(userWithoutPassword);
   } catch (error) {
@@ -553,7 +752,6 @@ app.patch('/api/users/:id/toggle', authenticateToken, requireAdmin, async (req, 
   try {
     const { id } = req.params;
     
-    // Check if is_active column exists
     const isActiveExists = await columnExists('users', 'is_active');
     if (!isActiveExists) {
       return res.status(400).json({ error: 'User activation not supported in current database version' });
@@ -571,13 +769,43 @@ app.patch('/api/users/:id/toggle', authenticateToken, requireAdmin, async (req, 
     const user = result.rows[0];
     const action = user.is_active ? 'activated' : 'deactivated';
     
-    // Log audit
     await logAudit(req.user.userId, 'UPDATE', 'user', id, `User ${user.username} ${action}`);
     
     res.json({ message: `User ${action} successfully` });
   } catch (error) {
     console.error('Error toggling user status:', error);
     res.status(500).json({ error: 'Failed to update user status' });
+  }
+});
+
+// NEW: Delete user permanently (admin only)
+app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Prevent admin from deleting themselves
+    if (parseInt(id) === req.user.userId) {
+      return res.status(400).json({ error: 'Cannot delete your own account' });
+    }
+    
+    // Get user info before deletion for audit log
+    const userResult = await query('SELECT * FROM users WHERE id = $1', [id]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userToDelete = userResult.rows[0];
+    
+    // Delete the user
+    await query('DELETE FROM users WHERE id = $1', [id]);
+    
+    // Log audit
+    await logAudit(req.user.userId, 'DELETE', 'user', id, `Permanently deleted user: ${userToDelete.username}`);
+    
+    res.json({ message: 'User deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
   }
 });
 
@@ -589,7 +817,6 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Current password and new password are required' });
     }
     
-    // Get current user
     const userResult = await query('SELECT * FROM users WHERE id = $1', [req.user.userId]);
     if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
@@ -597,16 +824,13 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Verify current password
     const validPassword = await bcrypt.compare(currentPassword, user.password_hash);
     if (!validPassword) {
       return res.status(400).json({ error: 'Current password is incorrect' });
     }
     
-    // Hash new password
     const hashedNewPassword = await bcrypt.hash(newPassword, 10);
     
-    // Update password
     const passwordChangedExists = await columnExists('users', 'password_changed_at');
     let updateQuery = 'UPDATE users SET password_hash = $1';
     const params = [hashedNewPassword];
@@ -620,7 +844,6 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
     
     await query(updateQuery, params);
     
-    // Log audit
     await logAudit(req.user.userId, 'UPDATE', 'user', req.user.userId, 'Password changed');
     
     res.json({ message: 'Password changed successfully' });
@@ -633,7 +856,6 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
 // Audit Log routes
 app.get('/api/audit-log', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    // Check if audit_log table exists
     const tableExists = await query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -681,7 +903,6 @@ app.get('/api/audit-log', authenticateToken, requireAdmin, async (req, res) => {
       LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}
     `, params);
     
-    // Get total count
     const countResult = await query(`
       SELECT COUNT(*) as total
       FROM audit_log al
@@ -705,7 +926,6 @@ app.post('/api/backup/create', authenticateToken, requireAdmin, async (req, res)
   try {
     const { backup_name, notes } = req.body;
     
-    // Check if database_backups table exists
     const tableExists = await query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -717,14 +937,12 @@ app.post('/api/backup/create', authenticateToken, requireAdmin, async (req, res)
       return res.status(400).json({ error: 'Backup functionality not available' });
     }
     
-    // Create backup record
     const result = await query(
       `INSERT INTO database_backups (backup_name, backup_type, created_by, notes) 
        VALUES ($1, $2, $3, $4) RETURNING *`,
       [backup_name || `backup_${Date.now()}`, 'manual', req.user.userId, notes]
     );
     
-    // Log audit
     await logAudit(req.user.userId, 'CREATE', 'backup', result.rows[0].id, `Database backup created: ${backup_name}`);
     
     res.json({
@@ -815,7 +1033,6 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
     
     const result = await query(insertQuery, values);
     
-    // Log audit
     await logAudit(req.user.userId, 'CREATE', 'customer', result.rows[0].id, `Created customer: ${name}`);
     
     res.json(result.rows[0]);
@@ -829,7 +1046,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
   }
 });
 
-// Order routes
+// Order routes (UPDATED - No email notifications)
 app.get('/api/orders', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -856,7 +1073,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     if (!customer_id || !sample_count) {
       return res.status(400).json({ error: 'Customer ID and sample count are required' });
     }
-    
+
     // Generate order number
     const orderNumber = 'ORD-' + Date.now();
     
@@ -866,7 +1083,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
       [customer_id, orderNumber, sample_count, shipping_method, priority, notes, req.user.userId]
     );
     
-    // Generate sample barcodes for this order
+    // Generate sample barcodes for this order (placeholder - will be assigned later)
     const order = result.rows[0];
     for (let i = 1; i <= sample_count; i++) {
       const barcode = `${orderNumber}-S${i.toString().padStart(2, '0')}`;
@@ -876,7 +1093,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
       );
     }
     
-    // Log audit
+    // Log audit (NO EMAIL NOTIFICATION)
     await logAudit(req.user.userId, 'CREATE', 'order', order.id, `Created order: ${orderNumber} (${sample_count} samples)`);
     
     res.json(order);
@@ -886,7 +1103,75 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
   }
 });
 
-// Sample routes
+// NEW: Assign barcodes to an order
+app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { barcodes } = req.body;
+    
+    if (!barcodes || !Array.isArray(barcodes)) {
+      return res.status(400).json({ error: 'Barcodes array is required' });
+    }
+    
+    // Get order info
+    const orderResult = await query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const order = orderResult.rows[0];
+    
+    // Validate barcode count matches sample count
+    if (barcodes.length !== order.sample_count) {
+      return res.status(400).json({ 
+        error: `Expected ${order.sample_count} barcodes, received ${barcodes.length}` 
+      });
+    }
+    
+    // Check for duplicate barcodes in database
+    const existingBarcodes = await query(
+      'SELECT barcode FROM samples WHERE barcode = ANY($1)',
+      [barcodes]
+    );
+    
+    if (existingBarcodes.rows.length > 0) {
+      const duplicates = existingBarcodes.rows.map(row => row.barcode);
+      return res.status(400).json({ 
+        error: `Barcodes already exist: ${duplicates.join(', ')}` 
+      });
+    }
+    
+    // Delete existing samples for this order (if any)
+    await query('DELETE FROM samples WHERE order_id = $1', [id]);
+    
+    // Create new samples with the provided barcodes
+    for (const barcode of barcodes) {
+      await query(
+        'INSERT INTO samples (order_id, barcode, status) VALUES ($1, $2, $3)',
+        [id, barcode, 'pending']
+      );
+    }
+    
+    // Log audit
+    await logAudit(
+      req.user.userId, 
+      'UPDATE', 
+      'order', 
+      id, 
+      `Assigned ${barcodes.length} barcodes to order ${order.order_number}`
+    );
+    
+    res.json({ 
+      message: 'Barcodes assigned successfully',
+      assigned_count: barcodes.length 
+    });
+  } catch (error) {
+    console.error('Error assigning barcodes:', error);
+    res.status(500).json({ error: 'Failed to assign barcodes' });
+  }
+});
+
+// Sample routes (UPDATED - No email notifications except for test results)
 app.get('/api/samples', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -932,14 +1217,14 @@ app.post('/api/samples/receive', authenticateToken, async (req, res) => {
     
     // Get customer info
     const sampleInfo = await query(`
-      SELECT s.*, o.order_number, c.name as customer_name
+      SELECT s.*, o.order_number, o.id as order_id, c.name as customer_name, c.email as customer_email
       FROM samples s
       JOIN orders o ON s.order_id = o.id
       JOIN customers c ON o.customer_id = c.id
       WHERE s.id = $1
     `, [result.rows[0].id]);
-    
-    // Log audit
+
+    // Log audit (NO EMAIL NOTIFICATION)
     await logAudit(req.user.userId, 'UPDATE', 'sample', result.rows[0].id, `Sample received: ${barcode}`);
     
     res.json({ 
@@ -995,7 +1280,7 @@ app.patch('/api/samples/:id/status', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Sample not found' });
     }
     
-    // Log audit
+    // Log audit (NO EMAIL NOTIFICATION)
     await logAudit(req.user.userId, 'UPDATE', 'sample', id, `Sample status changed to: ${status}`);
     
     res.json(result.rows[0]);
@@ -1059,7 +1344,7 @@ app.post('/api/batches', authenticateToken, async (req, res) => {
   }
 });
 
-// Test Results routes
+// Test Results routes (KEEP EMAIL FUNCTIONALITY - This is where PDF is generated)
 app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1080,6 +1365,80 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
       'UPDATE samples SET status = $1, completed_at = CURRENT_TIMESTAMP WHERE id = $2',
       ['complete', id]
     );
+
+    // Get order and customer info
+    const orderInfo = await query(`
+      SELECT o.*, c.name as customer_name, c.email as customer_email, c.company_name
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      JOIN customers c ON o.customer_id = c.id
+      WHERE s.id = $1
+    `, [id]);
+
+    if (orderInfo.rows.length > 0) {
+      const order = orderInfo.rows[0];
+      
+      // Check if all samples in this order are complete
+      const incompleteSamples = await query(
+        'SELECT COUNT(*) as count FROM samples WHERE order_id = $1 AND status != $2',
+        [order.id, 'complete']
+      );
+
+      if (incompleteSamples.rows[0].count === '0') {
+        // All samples complete - generate PDF and send results email
+        try {
+          const samplesData = await query(
+            'SELECT * FROM samples WHERE order_id = $1 ORDER BY barcode',
+            [order.id]
+          );
+          
+          const resultsData = await query(`
+            SELECT tr.* FROM test_results tr
+            JOIN samples s ON tr.sample_id = s.id
+            WHERE s.order_id = $1
+            ORDER BY s.barcode, tr.test_type
+          `, [order.id]);
+
+          const pdfBuffer = await generateTestResultsPDF(order, samplesData.rows, resultsData.rows);
+          
+          // Save PDF record
+          const pdfRecord = await query(
+            'INSERT INTO pdf_reports (order_id, report_type, filename, file_size, generated_by) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+            [order.id, 'test_results', `3R_Testing_Results_${order.order_number}.pdf`, pdfBuffer.length, req.user.userId]
+          );
+
+          // Send results email with PDF attachment
+          const emailSent = await sendResultsReadyEmail(
+            order.customer_email,
+            order.customer_name,
+            order.order_number,
+            pdfBuffer
+          );
+
+          // Log email notification
+          await query(
+            `INSERT INTO email_notifications (recipient_email, recipient_name, subject, order_id, notification_type, status, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              order.customer_email,
+              order.customer_name,
+              `3R Testing - Results Ready for Order ${order.order_number}`,
+              order.id,
+              'results_ready',
+              emailSent ? 'sent' : 'failed',
+              req.user.userId
+            ]
+          );
+
+          // Update order status to complete
+          await query('UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', ['complete', order.id]);
+          
+        } catch (pdfError) {
+          console.error('PDF generation failed:', pdfError);
+          // Continue without PDF/email
+        }
+      }
+    }
     
     // Log audit
     await logAudit(req.user.userId, 'CREATE', 'test_result', resultData.rows[0].id, `Added ${test_type} result: ${result}`);
@@ -1088,6 +1447,149 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error adding test result:', error);
     res.status(500).json({ error: 'Failed to add test result' });
+  }
+});
+
+// Download PDF report
+app.get('/api/orders/:id/pdf', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get order info
+    const orderInfo = await query(`
+      SELECT o.*, c.name as customer_name, c.email as customer_email, c.company_name
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      WHERE o.id = $1
+    `, [id]);
+
+    if (orderInfo.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orderInfo.rows[0];
+
+    // Get samples and results
+    const samplesData = await query(
+      'SELECT * FROM samples WHERE order_id = $1 ORDER BY barcode',
+      [id]
+    );
+    
+    const resultsData = await query(`
+      SELECT tr.* FROM test_results tr
+      JOIN samples s ON tr.sample_id = s.id
+      WHERE s.order_id = $1
+      ORDER BY s.barcode, tr.test_type
+    `, [id]);
+
+    // Generate PDF
+    const pdfBuffer = await generateTestResultsPDF(order, samplesData.rows, resultsData.rows);
+    
+    // Update download count
+    await query(
+      'UPDATE pdf_reports SET download_count = download_count + 1 WHERE order_id = $1',
+      [id]
+    );
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="3R_Testing_Results_${order.order_number}.pdf"`);
+    res.send(pdfBuffer);
+    
+  } catch (error) {
+    console.error('Error generating PDF:', error);
+    res.status(500).json({ error: 'Failed to generate PDF report' });
+  }
+});
+
+// Email notifications history
+app.get('/api/notifications', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT en.*, o.order_number, u.username as sent_by
+      FROM email_notifications en
+      LEFT JOIN orders o ON en.order_id = o.id
+      LEFT JOIN users u ON en.created_by = u.id
+      ORDER BY en.created_at DESC
+      LIMIT 100
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching notifications:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+// Resend notification
+app.post('/api/notifications/:id/resend', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const notification = await query(
+      'SELECT * FROM email_notifications WHERE id = $1',
+      [id]
+    );
+    
+    if (notification.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    const notif = notification.rows[0];
+    
+    // Get order info if needed
+    let emailSent = false;
+    if (notif.order_id) {
+      const orderInfo = await query(`
+        SELECT o.*, c.name as customer_name
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE o.id = $1
+      `, [notif.order_id]);
+      
+      if (orderInfo.rows.length > 0) {
+        const order = orderInfo.rows[0];
+        
+        // For results_ready notifications, need to regenerate PDF
+        if (notif.notification_type === 'results_ready') {
+          try {
+            const samplesData = await query(
+              'SELECT * FROM samples WHERE order_id = $1 ORDER BY barcode',
+              [order.id]
+            );
+            
+            const resultsData = await query(`
+              SELECT tr.* FROM test_results tr
+              JOIN samples s ON tr.sample_id = s.id
+              WHERE s.order_id = $1
+              ORDER BY s.barcode, tr.test_type
+            `, [order.id]);
+
+            const pdfBuffer = await generateTestResultsPDF(order, samplesData.rows, resultsData.rows);
+            
+            emailSent = await sendResultsReadyEmail(
+              notif.recipient_email,
+              notif.recipient_name,
+              order.order_number,
+              pdfBuffer
+            );
+          } catch (pdfError) {
+            console.error('PDF regeneration failed:', pdfError);
+            emailSent = false;
+          }
+        }
+      }
+    }
+
+    // Update notification status
+    await query(
+      'UPDATE email_notifications SET status = $1, sent_at = CURRENT_TIMESTAMP WHERE id = $2',
+      [emailSent ? 'sent' : 'failed', id]
+    );
+
+    res.json({ message: emailSent ? 'Notification resent successfully' : 'Failed to resend notification' });
+  } catch (error) {
+    console.error('Error resending notification:', error);
+    res.status(500).json({ error: 'Failed to resend notification' });
   }
 });
 
@@ -1113,7 +1615,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
       `).catch(() => ({ rows: [] })) // Handle case where audit_log doesn't exist
     ]);
     
-    const stats = {
+     const stats = {
       pending_orders: 0,
       shipped_orders: 0,
       processing_orders: 0,
@@ -1172,4 +1674,4 @@ app.listen(PORT, async () => {
   }
 });
 
-module.exports = app;
+module.exports = app; 
