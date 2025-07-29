@@ -19,8 +19,8 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Email configuration
-const emailTransporter = nodemailer.createTransporter({
+// Email configuration - FIXED: createTransport not createTransporter
+const emailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: process.env.SMTP_PORT || 587,
   secure: false,
@@ -247,13 +247,17 @@ const PRODUCT_SAMPLE_MAPPING = {
   'combo-test': { sample_count: 1, test_type: 'Fus+Pyth' }
 };
 
-// Initialize database tables (same as before but with flexible shipping schema)
+// Initialize database tables
 async function initializeDatabase() {
   try {
     console.log('Initializing database tables...');
     
-    // [Previous database initialization code remains the same until shipping tables]
-    
+    // Create default admin user if not exists
+    const defaultUsers = [
+      { username: 'admin', password: 'admin123', role: 'admin', email: 'admin@3rtesting.com', full_name: 'System Administrator' },
+      { username: 'technician', password: 'tech123', role: 'technician', email: 'tech@3rtesting.com', full_name: 'Lab Technician' }
+    ];
+
     // Create basic users table if it doesn't exist
     await query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -284,7 +288,20 @@ async function initializeDatabase() {
       }
     }
 
-    // Create other tables (customers, orders, samples, etc. - same as before)
+    // Create default users
+    for (const user of defaultUsers) {
+      const existingUser = await query('SELECT id FROM users WHERE username = $1', [user.username]);
+      if (existingUser.rows.length === 0) {
+        const hashedPassword = await bcrypt.hash(user.password, 10);
+        await query(
+          'INSERT INTO users (username, password_hash, role, email, full_name) VALUES ($1, $2, $3, $4, $5)',
+          [user.username, hashedPassword, user.role, user.email, user.full_name]
+        );
+        console.log(`Created default user: ${user.username}`);
+      }
+    }
+
+    // Create customers table
     await query(`
       CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -398,7 +415,7 @@ async function initializeDatabase() {
       }
     }
 
-    // Create other tables (test_results, batches, etc. - same as before)
+    // Create test_results table
     await query(`
       CREATE TABLE IF NOT EXISTS test_results (
         id SERIAL PRIMARY KEY,
@@ -412,6 +429,21 @@ async function initializeDatabase() {
         analyst VARCHAR(100),
         analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         notes TEXT
+      )
+    `);
+
+    // Create batches table
+    await query(`
+      CREATE TABLE IF NOT EXISTS batches (
+        id SERIAL PRIMARY KEY,
+        batch_id VARCHAR(50) UNIQUE NOT NULL,
+        test_type VARCHAR(100),
+        status VARCHAR(50) DEFAULT 'active',
+        sample_count INTEGER DEFAULT 0,
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP,
+        notes TEXT,
+        created_by INTEGER REFERENCES users(id)
       )
     `);
 
@@ -431,16 +463,137 @@ async function initializeDatabase() {
       )
     `);
 
-    // [Continue with other table creation - audit_log, email_notifications, etc.]
+    // Create audit log table
+    await query(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        action VARCHAR(50),
+        entity_type VARCHAR(50),
+        entity_id INTEGER,
+        details TEXT,
+        ip_address VARCHAR(50),
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create email notifications table
+    await query(`
+      CREATE TABLE IF NOT EXISTS email_notifications (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER REFERENCES orders(id),
+        notification_type VARCHAR(100),
+        recipient_email VARCHAR(255),
+        recipient_name VARCHAR(255),
+        subject VARCHAR(500),
+        body TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        sent_at TIMESTAMP,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     console.log('✅ Database tables initialized successfully');
+    
+    // Create sample data for demonstration
+    await createSampleData();
+    
   } catch (error) {
     console.error('❌ Database initialization failed:', error);
     throw error;
   }
 }
 
-// Helper functions (same as before for customer creation, address formatting, etc.)
+// Create sample data for demonstration
+async function createSampleData() {
+  try {
+    // Check if sample customers exist
+    const customerCount = await query('SELECT COUNT(*) FROM customers');
+    if (parseInt(customerCount.rows[0].count) === 0) {
+      console.log('Creating sample customers...');
+      
+      const sampleCustomers = [
+        {
+          name: 'John Smith',
+          email: 'john.smith@example.com',
+          company_name: 'Green Valley Farms',
+          phone: '555-123-4567',
+          shipping_address: '123 Farm Road, Green Valley, CA 90210',
+          billing_address: '123 Farm Road, Green Valley, CA 90210'
+        },
+        {
+          name: 'Sarah Johnson',
+          email: 'sarah.johnson@hydroponics.com',
+          company_name: 'Advanced Hydroponics Inc',
+          phone: '555-987-6543',
+          shipping_address: '456 Tech Boulevard, Innovation City, CA 94102',
+          billing_address: '456 Tech Boulevard, Innovation City, CA 94102'
+        }
+      ];
+
+      for (const customer of sampleCustomers) {
+        await query(`
+          INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `, [customer.name, customer.email, customer.company_name, customer.phone, customer.shipping_address, customer.billing_address, 1]);
+      }
+      
+      console.log('✅ Sample customers created');
+    }
+
+    // Create sample orders
+    const orderCount = await query('SELECT COUNT(*) FROM orders');
+    if (parseInt(orderCount.rows[0].count) === 0) {
+      console.log('Creating sample orders...');
+      
+      const sampleOrders = [
+        {
+          customer_id: 1,
+          order_number: 'ORD-001',
+          sample_count: 5,
+          test_type: 'HLVD',
+          status: 'pending',
+          priority: 'normal',
+          shipping_method: 'ups_ground'
+        },
+        {
+          customer_id: 2,
+          order_number: 'ORD-002',
+          sample_count: 10,
+          test_type: 'Fusarium',
+          status: 'shipped',
+          priority: 'high',
+          shipping_method: 'ups_2day',
+          tracking_number: '1Z999AA1234567890'
+        }
+      ];
+
+      for (const order of sampleOrders) {
+        const orderResult = await query(`
+          INSERT INTO orders (customer_id, order_number, sample_count, test_type, status, priority, shipping_method, tracking_number, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id
+        `, [order.customer_id, order.order_number, order.sample_count, order.test_type, order.status, order.priority, order.shipping_method, order.tracking_number || null, 1]);
+        
+        // Create sample barcodes for each order
+        for (let i = 1; i <= order.sample_count; i++) {
+          const barcode = `${order.order_number}-S${i.toString().padStart(2, '0')}`;
+          await query(`
+            INSERT INTO samples (order_id, barcode, sample_type, status)
+            VALUES ($1, $2, $3, $4)
+          `, [orderResult.rows[0].id, barcode, order.test_type, order.status === 'shipped' ? 'received' : 'pending']);
+        }
+      }
+      
+      console.log('✅ Sample orders and samples created');
+    }
+
+  } catch (error) {
+    console.log('Sample data creation failed (this is okay for existing databases):', error.message);
+  }
+}
+
+// Helper functions
 const findOrCreateCustomer = async (wooCustomerData) => {
   try {
     // First try to find by WooCommerce ID
@@ -550,7 +703,271 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// WooCommerce Webhook (same as before)
+// Authentication endpoints
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password required' });
+    }
+    
+    const userResult = await query(
+      'SELECT * FROM users WHERE username = $1 AND is_active = true',
+      [username]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = userResult.rows[0];
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login
+    await query(
+      'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1',
+      [user.id]
+    );
+    
+    const token = jwt.sign(
+      { userId: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        email: user.email,
+        full_name: user.full_name
+      }
+    });
+    
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Customers endpoints
+app.get('/api/customers', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT c.*, 
+             COUNT(o.id) as total_orders,
+             MAX(o.created_at) as last_order_date
+      FROM customers c
+      LEFT JOIN orders o ON c.id = o.customer_id
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Customers fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+app.post('/api/customers', authenticateToken, async (req, res) => {
+  try {
+    const { name, email, company_name, phone, shipping_address } = req.body;
+    
+    if (!name || !email) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+    
+    // Check for duplicate email
+    const existingCustomer = await query(
+      'SELECT id FROM customers WHERE email = $1',
+      [email]
+    );
+    
+    if (existingCustomer.rows.length > 0) {
+      return res.status(409).json({ error: 'Customer with this email already exists' });
+    }
+    
+    const result = await query(`
+      INSERT INTO customers (name, email, company_name, phone, shipping_address, billing_address, created_by)
+      VALUES ($1, $2, $3, $4, $5, $5, $6) RETURNING *
+    `, [name, email, company_name, phone, shipping_address, req.user.userId]);
+    
+    await logAudit(req.user.userId, 'CREATE', 'customer', result.rows[0].id, `Created customer: ${name}`);
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Customer creation error:', error);
+    res.status(500).json({ error: 'Failed to create customer' });
+  }
+});
+
+// Orders endpoints
+app.get('/api/orders', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT o.*, 
+             c.name as customer_name,
+             c.email as customer_email,
+             c.company_name,
+             COUNT(s.id) as received_samples,
+             STRING_AGG(DISTINCT s.status, ', ') as sample_statuses
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN samples s ON o.id = s.order_id
+      GROUP BY o.id, c.id
+      ORDER BY o.created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Orders fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+app.post('/api/orders', authenticateToken, async (req, res) => {
+  try {
+    const { customer_id, sample_count, priority = 'normal', shipping_method = 'ups_ground', notes } = req.body;
+    
+    if (!customer_id || !sample_count) {
+      return res.status(400).json({ error: 'Customer ID and sample count are required' });
+    }
+    
+    // Generate order number
+    const orderCountResult = await query('SELECT COUNT(*) FROM orders');
+    const orderNumber = `ORD-${(parseInt(orderCountResult.rows[0].count) + 1).toString().padStart(3, '0')}`;
+    
+    const result = await query(`
+      INSERT INTO orders (customer_id, order_number, sample_count, priority, shipping_method, notes, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
+    `, [customer_id, orderNumber, sample_count, priority, shipping_method, notes, req.user.userId]);
+    
+    const order = result.rows[0];
+    
+    // Create placeholder samples
+    for (let i = 1; i <= sample_count; i++) {
+      const barcode = `${orderNumber}-S${i.toString().padStart(2, '0')}`;
+      await query(
+        'INSERT INTO samples (order_id, barcode) VALUES ($1, $2)',
+        [order.id, barcode]
+      );
+    }
+    
+    await logAudit(req.user.userId, 'CREATE', 'order', order.id, `Created order: ${orderNumber}`);
+    
+    res.status(201).json(order);
+  } catch (error) {
+    console.error('Order creation error:', error);
+    res.status(500).json({ error: 'Failed to create order' });
+  }
+});
+
+// Samples endpoints
+app.get('/api/samples', authenticateToken, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT s.*, 
+             o.order_number,
+             c.name as customer_name,
+             c.company_name
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      JOIN customers c ON o.customer_id = c.id
+      ORDER BY s.created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Samples fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch samples' });
+  }
+});
+
+app.post('/api/samples/receive', authenticateToken, async (req, res) => {
+  try {
+    const { barcode, location = 'Main Lab', notes = '' } = req.body;
+    
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode is required' });
+    }
+    
+    // Find sample
+    const sampleResult = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      JOIN customers c ON o.customer_id = c.id
+      WHERE s.barcode = $1
+    `, [barcode]);
+    
+    if (sampleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Sample not found' });
+    }
+    
+    const sample = sampleResult.rows[0];
+    
+    // Update sample status
+    await query(`
+      UPDATE samples SET 
+        status = 'received',
+        received_at = CURRENT_TIMESTAMP,
+        received_by = $1,
+        location = $2,
+        notes = $3
+      WHERE id = $4
+    `, [req.user.userId, location, notes, sample.id]);
+    
+    await logAudit(req.user.userId, 'UPDATE', 'sample', sample.id, `Received sample: ${barcode}`);
+    
+    res.json({ 
+      message: 'Sample received successfully',
+      sample: { ...sample, status: 'received', location, notes }
+    });
+    
+  } catch (error) {
+    console.error('Sample receive error:', error);
+    res.status(500).json({ error: 'Failed to receive sample' });
+  }
+});
+
+// Dashboard stats
+app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
+  try {
+    const stats = await Promise.all([
+      query('SELECT COUNT(*) FROM orders WHERE status = $1', ['pending']),
+      query('SELECT COUNT(*) FROM orders WHERE status = $1', ['shipped']),
+      query('SELECT COUNT(*) FROM samples WHERE status = $1', ['processing']),
+      query('SELECT COUNT(*) FROM orders WHERE status = $1', ['complete']),
+      query('SELECT COUNT(*) FROM orders WHERE woocommerce_order_id IS NOT NULL'),
+      query('SELECT COUNT(*) FROM customers'),
+      query('SELECT COUNT(*) FROM samples')
+    ]);
+    
+    res.json({
+      pending_orders: parseInt(stats[0].rows[0].count),
+      shipped_orders: parseInt(stats[1].rows[0].count),
+      processing_samples: parseInt(stats[2].rows[0].count),
+      completed_orders: parseInt(stats[3].rows[0].count),
+      woocommerce_orders: parseInt(stats[4].rows[0].count),
+      total_customers: parseInt(stats[5].rows[0].count),
+      total_samples: parseInt(stats[6].rows[0].count)
+    });
+    
+  } catch (error) {
+    console.error('Dashboard stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard stats' });
+  }
+});
+
+// WooCommerce Webhook
 app.post('/api/webhooks/woocommerce', async (req, res) => {
   try {
     const signature = req.headers['x-wc-webhook-signature'];
@@ -638,154 +1055,7 @@ app.post('/api/webhooks/woocommerce', async (req, res) => {
   }
 });
 
-// Flexible Shipping Endpoints
-
-// Get shipping rates (manual or API-based)
-app.get('/api/shipping/rates/:order_id', authenticateToken, async (req, res) => {
-  try {
-    const { order_id } = req.params;
-    
-    // Get order details
-    const orderResult = await query(`
-      SELECT o.*, c.shipping_address, c.billing_address
-      FROM orders o
-      JOIN customers c ON o.customer_id = c.id
-      WHERE o.id = $1
-    `, [order_id]);
-    
-    if (orderResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    
-    // Return standard rates (can be enhanced with real API calls)
-    const rates = [
-      {
-        service: 'ups_ground',
-        name: 'UPS Ground',
-        cost: 8.50,
-        delivery_days: '1-5 business days',
-        recommended: true,
-        api_provider: 'manual'
-      },
-      {
-        service: 'ups_2day',
-        name: 'UPS 2nd Day Air',
-        cost: 15.99,
-        delivery_days: '2 business days',
-        recommended: false,
-        api_provider: 'manual'
-      },
-      {
-        service: 'ups_next_day',
-        name: 'UPS Next Day Air',
-        cost: 25.99,
-        delivery_days: '1 business day',
-        recommended: false,
-        api_provider: 'manual'
-      }
-    ];
-    
-    res.json({ rates });
-  } catch (error) {
-    console.error('Shipping rates error:', error);
-    res.status(500).json({ error: 'Failed to get shipping rates' });
-  }
-});
-
-// Create shipping label (flexible)
-app.post('/api/shipping/create-label', authenticateToken, async (req, res) => {
-  try {
-    const { order_id, service_type = 'ups_ground', api_provider = 'manual' } = req.body;
-    
-    // Get order and customer details
-    const orderResult = await query(`
-      SELECT o.*, c.name as customer_name, c.email as customer_email,
-             c.shipping_address, c.billing_address, c.phone
-      FROM orders o
-      JOIN customers c ON o.customer_id = c.id
-      WHERE o.id = $1
-    `, [order_id]);
-    
-    if (orderResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    
-    const order = orderResult.rows[0];
-    
-    // Use the appropriate shipping API
-    const shippingAPI = createShippingAPI();
-    const labelResult = await shippingAPI[api_provider].createLabel({
-      order: order,
-      service: service_type,
-      estimated_cost: service_type === 'ups_ground' ? 8.50 : 
-                     service_type === 'ups_2day' ? 15.99 : 25.99
-    });
-    
-    // Save shipping label info
-    const labelRecord = await query(`
-      INSERT INTO shipping_labels (
-        order_id, tracking_number, carrier, service,
-        cost, label_url, api_provider, status, created_by
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
-    `, [
-      order_id,
-      labelResult.tracking_number,
-      labelResult.carrier,
-      service_type,
-      labelResult.cost,
-      labelResult.label_url,
-      api_provider,
-      'created',
-      req.user.userId
-    ]);
-    
-    // Update order with tracking info
-    await query(`
-      UPDATE orders SET 
-        tracking_number = $1, 
-        shipping_cost = $2,
-        shipping_service = $3,
-        shipping_carrier = $4,
-        shipping_api_used = $5,
-        label_created_at = CURRENT_TIMESTAMP,
-        status = CASE WHEN status = 'pending' THEN 'label_created' ELSE status END,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $6
-    `, [
-      labelResult.tracking_number,
-      labelResult.cost,
-      service_type,
-      labelResult.carrier,
-      api_provider,
-      order_id
-    ]);
-    
-    await logAudit(
-      req.user.userId, 
-      'CREATE', 
-      'shipping_label', 
-      labelRecord.rows[0].id, 
-      `Created ${service_type} label using ${api_provider} for order ${order.order_number}`
-    );
-    
-    res.json({
-      message: 'Shipping label created successfully',
-      tracking_number: labelResult.tracking_number,
-      label_url: labelResult.label_url,
-      cost: labelResult.cost,
-      api_provider: api_provider
-    });
-    
-  } catch (error) {
-    console.error('Shipping label creation error:', error);
-    res.status(500).json({ 
-      error: 'Failed to create shipping label',
-      details: error.message
-    });
-  }
-});
-
-// Manual tracking number entry
+// Manual shipping endpoints
 app.post('/api/shipping/manual-tracking', authenticateToken, async (req, res) => {
   try {
     const { order_id, tracking_number, carrier = 'UPS', service = 'Ground', cost = 0 } = req.body;
@@ -838,43 +1108,81 @@ app.post('/api/shipping/manual-tracking', authenticateToken, async (req, res) =>
   }
 });
 
-// Track shipment (flexible)
-app.get('/api/shipping/track/:tracking_number', authenticateToken, async (req, res) => {
+// Get all batches
+app.get('/api/batches', authenticateToken, async (req, res) => {
   try {
-    const { tracking_number } = req.params;
+    const result = await query(`
+      SELECT b.*, 
+             COUNT(s.id) as actual_sample_count,
+             u.full_name as created_by_name
+      FROM batches b
+      LEFT JOIN samples s ON b.batch_id = s.batch_id
+      LEFT JOIN users u ON b.created_by = u.id
+      GROUP BY b.id, u.full_name
+      ORDER BY b.created_at DESC
+    `);
     
-    // Get shipping info from database
-    const shippingResult = await query(`
-      SELECT sl.*, o.order_number 
-      FROM shipping_labels sl
-      JOIN orders o ON sl.order_id = o.id
-      WHERE sl.tracking_number = $1
-    `, [tracking_number]);
-    
-    if (shippingResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Tracking number not found' });
-    }
-    
-    const shippingInfo = shippingResult.rows[0];
-    
-    // Use appropriate tracking API or return manual status
-    const shippingAPI = createShippingAPI();
-    const trackingResult = await shippingAPI[shippingInfo.api_provider].trackShipment(tracking_number);
-    
-    res.json({
-      ...trackingResult,
-      order_number: shippingInfo.order_number,
-      api_provider: shippingInfo.api_provider
-    });
-    
+    res.json(result.rows);
   } catch (error) {
-    console.error('Tracking error:', error);
-    res.status(500).json({ error: 'Failed to track shipment' });
+    console.error('Batches fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch batches' });
   }
 });
 
-// [Continue with all other existing routes - authentication, customers, orders, samples, etc.]
-// [The rest of your existing API endpoints remain the same]
+// Get all users (admin only)
+app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT id, username, role, email, full_name, is_active, 
+             last_login, created_at, created_by
+      FROM users 
+      ORDER BY created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Users fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// Get audit log (admin only)
+app.get('/api/audit-log', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const limit = req.query.limit || 50;
+    const result = await query(`
+      SELECT a.*, u.username, u.full_name
+      FROM audit_log a
+      LEFT JOIN users u ON a.user_id = u.id
+      ORDER BY a.timestamp DESC
+      LIMIT $1
+    `, [limit]);
+    
+    res.json({ logs: result.rows });
+  } catch (error) {
+    console.error('Audit log fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch audit log' });
+  }
+});
+
+// Get email notifications (admin only)
+app.get('/api/notifications', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT en.*, o.order_number, c.name as recipient_name
+      FROM email_notifications en
+      LEFT JOIN orders o ON en.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
+      ORDER BY en.created_at DESC
+      LIMIT 100
+    `);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Notifications fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
 
 // Start server
 app.listen(PORT, async () => {
