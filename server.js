@@ -99,9 +99,10 @@ const logAudit = async (userId, action, entityType, entityId, details = null) =>
   }
 };
 
-// Barcode validation helper
+// Enhanced barcode validation helper (replace the existing one)
 const validateBarcode = (barcode) => {
-  const pattern = /^[A-Z0-9]{8}$/;
+  // Allow letters followed by numbers (more flexible than the original 8-character limit)
+  const pattern = /^[A-Z]+\d+$/;
   return pattern.test(barcode.toUpperCase());
 };
 
@@ -463,38 +464,125 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/orders', authenticateToken, async (req, res) => {
+// Enhanced barcode assignment endpoint (replace the existing one)
+app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) => {
   try {
-    const { customer_id, sample_count, priority = 'normal', shipping_method = 'ups_ground', notes } = req.body;
+    const { id } = req.params;
+    const { barcodes } = req.body;
     
-    if (!customer_id || !sample_count) {
-      return res.status(400).json({ error: 'Customer ID and sample count are required' });
+    console.log(`Assigning barcodes to order ${id}:`, barcodes); // Debug log
+    
+    if (!barcodes || !Array.isArray(barcodes)) {
+      return res.status(400).json({ error: 'Barcodes array is required' });
     }
     
-    const orderCountResult = await query('SELECT COUNT(*) FROM orders');
-    const orderNumber = `ORD-${(parseInt(orderCountResult.rows[0].count) + 1).toString().padStart(3, '0')}`;
-    
-    const result = await query(`
-      INSERT INTO orders (customer_id, order_number, sample_count, priority, shipping_method, notes, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
-    `, [customer_id, orderNumber, sample_count, priority, shipping_method, notes, req.user.userId]);
-    
-    const order = result.rows[0];
-    
-    for (let i = 1; i <= sample_count; i++) {
-      const barcode = `${orderNumber}-S${i.toString().padStart(2, '0')}`;
-      await query(
-        'INSERT INTO samples (order_id, barcode) VALUES ($1, $2)',
-        [order.id, barcode]
-      );
+    if (barcodes.length === 0) {
+      return res.status(400).json({ error: 'At least one barcode is required' });
     }
     
-    await logAudit(req.user.userId, 'CREATE', 'order', order.id, `Created order: ${orderNumber}`);
+    // Get order details
+    const orderResult = await query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
     
-    res.status(201).json(order);
+    const order = orderResult.rows[0];
+    
+    if (barcodes.length !== order.sample_count) {
+      return res.status(400).json({ 
+        error: `Expected ${order.sample_count} barcodes, received ${barcodes.length}` 
+      });
+    }
+    
+    // Validate each barcode format
+    const invalidBarcodes = [];
+    const normalizedBarcodes = [];
+    
+    for (let i = 0; i < barcodes.length; i++) {
+      const barcode = barcodes[i].toString().trim().toUpperCase();
+      
+      if (!barcode) {
+        invalidBarcodes.push(`Empty barcode at position ${i + 1}`);
+        continue;
+      }
+      
+      if (!validateBarcode(barcode)) {
+        invalidBarcodes.push(`Invalid format: ${barcode} (should be letters followed by numbers, e.g., CA000001)`);
+        continue;
+      }
+      
+      normalizedBarcodes.push(barcode);
+    }
+    
+    if (invalidBarcodes.length > 0) {
+      return res.status(400).json({ 
+        error: 'Invalid barcode formats detected',
+        details: invalidBarcodes 
+      });
+    }
+    
+    // Check for duplicates
+    const uniqueBarcodes = [...new Set(normalizedBarcodes)];
+    if (uniqueBarcodes.length !== normalizedBarcodes.length) {
+      return res.status(400).json({ error: 'Duplicate barcodes detected. Please ensure all barcodes are unique.' });
+    }
+    
+    // Check if any barcodes already exist in the system
+    const existingBarcodesResult = await query(
+      'SELECT barcode FROM samples WHERE barcode = ANY($1::text[])',
+      [normalizedBarcodes]
+    );
+    
+    if (existingBarcodesResult.rows.length > 0) {
+      const existingBarcodes = existingBarcodesResult.rows.map(row => row.barcode);
+      return res.status(409).json({ 
+        error: 'Some barcodes already exist in the system',
+        existing_barcodes: existingBarcodes
+      });
+    }
+    
+    // Begin transaction
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      // Delete existing samples for this order
+      await client.query('DELETE FROM samples WHERE order_id = $1', [id]);
+      
+      // Create new samples with assigned barcodes
+      for (let i = 0; i < normalizedBarcodes.length; i++) {
+        const barcode = normalizedBarcodes[i];
+        
+        await client.query(
+          'INSERT INTO samples (order_id, barcode, sample_type, status) VALUES ($1, $2, $3, $4)',
+          [id, barcode, order.test_type || 'environmental', 'pending']
+        );
+      }
+      
+      await client.query('COMMIT');
+      
+      await logAudit(req.user.userId, 'UPDATE', 'order', id, 
+        `Assigned ${normalizedBarcodes.length} barcodes: ${normalizedBarcodes.slice(0, 3).join(', ')}${normalizedBarcodes.length > 3 ? '...' : ''}`);
+      
+      res.json({ 
+        message: 'Barcodes assigned successfully',
+        assigned_count: normalizedBarcodes.length,
+        barcodes: normalizedBarcodes
+      });
+      
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    
   } catch (error) {
-    console.error('Order creation error:', error);
-    res.status(500).json({ error: 'Failed to create order' });
+    console.error('Barcode assignment error:', error);
+    res.status(500).json({ 
+      error: 'Failed to assign barcodes',
+      details: error.message 
+    });
   }
 });
 
