@@ -707,12 +707,13 @@ app.get('/api/samples', authenticateToken, async (req, res) => {
     const result = await query(`
       SELECT s.*, 
              o.order_number,
+             o.id as order_id,
              c.name as customer_name,
              c.company_name,
              u.full_name as received_by_name
       FROM samples s
-      JOIN orders o ON s.order_id = o.id
-      JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN orders o ON s.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
       LEFT JOIN users u ON s.received_by = u.id
       ORDER BY s.created_at DESC
     `);
