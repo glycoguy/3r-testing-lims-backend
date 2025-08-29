@@ -111,7 +111,7 @@ async function initializeDatabase() {
   try {
     console.log('Initializing database tables...');
     
-    // Users table
+    // Create users table with all columns
     await query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -129,7 +129,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // Customers table
+    // Create customers table with all columns
     await query(`
       CREATE TABLE IF NOT EXISTS customers (
         id SERIAL PRIMARY KEY,
@@ -140,15 +140,15 @@ async function initializeDatabase() {
         shipping_address TEXT,
         billing_address TEXT,
         notes TEXT,
-        woocommerce_id INTEGER UNIQUE,
+        woocommerce_id INTEGER,
         woocommerce_username VARCHAR(100),
-        created_by INTEGER REFERENCES users(id),
+        created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    // Orders table
+    // Create orders table with all columns
     await query(`
       CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
@@ -160,7 +160,7 @@ async function initializeDatabase() {
         status VARCHAR(50) DEFAULT 'pending',
         tracking_number VARCHAR(100),
         notes TEXT,
-        woocommerce_order_id INTEGER UNIQUE,
+        woocommerce_order_id INTEGER,
         woocommerce_status VARCHAR(50),
         shipping_cost DECIMAL(10,2),
         shipping_service VARCHAR(50),
@@ -170,33 +170,46 @@ async function initializeDatabase() {
         shipped_at TIMESTAMP,
         delivered_at TIMESTAMP,
         test_type VARCHAR(100),
-        created_by INTEGER REFERENCES users(id),
+        created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    // Samples table
+    // Create samples table with ALL required columns
     await query(`
       CREATE TABLE IF NOT EXISTS samples (
         id SERIAL PRIMARY KEY,
         order_id INTEGER REFERENCES orders(id),
         barcode VARCHAR(50) UNIQUE NOT NULL,
-        sample_type VARCHAR(50) DEFAULT 'environmental',
         status VARCHAR(50) DEFAULT 'pending',
         received_at TIMESTAMP,
         processed_at TIMESTAMP,
         completed_at TIMESTAMP,
         batch_id VARCHAR(50),
-        location VARCHAR(100),
         notes TEXT,
-        received_by INTEGER REFERENCES users(id),
-        processed_by INTEGER REFERENCES users(id),
+        received_by INTEGER,
+        processed_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    // Test results table
+    // Create batches table with ALL required columns  
+    await query(`
+      CREATE TABLE IF NOT EXISTS batches (
+        id SERIAL PRIMARY KEY,
+        batch_id VARCHAR(50) UNIQUE NOT NULL,
+        test_type VARCHAR(100),
+        status VARCHAR(50) DEFAULT 'active',
+        sample_count INTEGER DEFAULT 0,
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP,
+        notes TEXT,
+        created_by INTEGER
+      )
+    `);
+
+    // Create other required tables
     await query(`
       CREATE TABLE IF NOT EXISTS test_results (
         id SERIAL PRIMARY KEY,
@@ -213,22 +226,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Batches table
-    await query(`
-      CREATE TABLE IF NOT EXISTS batches (
-        id SERIAL PRIMARY KEY,
-        batch_id VARCHAR(50) UNIQUE NOT NULL,
-        test_type VARCHAR(100),
-        status VARCHAR(50) DEFAULT 'active',
-        sample_count INTEGER DEFAULT 0,
-        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        completed_at TIMESTAMP,
-        notes TEXT,
-        created_by INTEGER REFERENCES users(id)
-      )
-    `);
-
-    // Email notifications table
     await query(`
       CREATE TABLE IF NOT EXISTS email_notifications (
         id SERIAL PRIMARY KEY,
@@ -245,11 +242,10 @@ async function initializeDatabase() {
       )
     `);
 
-    // Audit log table
     await query(`
       CREATE TABLE IF NOT EXISTS audit_log (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
+        user_id INTEGER,
         action VARCHAR(50),
         entity_type VARCHAR(50),
         entity_id INTEGER,
@@ -705,23 +701,29 @@ app.get('/api/orders/:id/pdf', authenticateToken, async (req, res) => {
 app.get('/api/samples', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
-      SELECT s.*, 
-             o.order_number,
-             o.id as order_id,
-             c.name as customer_name,
-             c.company_name,
-             u.full_name as received_by_name
+      SELECT 
+        s.id,
+        s.barcode,
+        s.status,
+        s.received_at,
+        s.batch_id,
+        s.notes,
+        s.created_at,
+        s.order_id,
+        o.order_number,
+        c.name as customer_name,
+        c.company_name
       FROM samples s
       LEFT JOIN orders o ON s.order_id = o.id
       LEFT JOIN customers c ON o.customer_id = c.id
-      LEFT JOIN users u ON s.received_by = u.id
       ORDER BY s.created_at DESC
     `);
     
+    console.log(`Returning ${result.rows.length} samples to frontend`);
     res.json(result.rows);
   } catch (error) {
     console.error('Samples fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch samples' });
+    res.status(500).json({ error: 'Failed to fetch samples', details: error.message });
   }
 });
 
