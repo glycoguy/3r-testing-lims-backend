@@ -19,6 +19,17 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
+// Auto Order Creation
+const AUTO_CREATE_CONFIG = {
+  enabled: process.env.AUTO_CREATE_ORDERS === 'true',
+  default_customer: {
+    name: process.env.DEFAULT_CUSTOMER_NAME || 'Walk-in Customer',
+    email: process.env.DEFAULT_CUSTOMER_EMAIL || 'walkin@3rtesting.com',
+    company: process.env.DEFAULT_CUSTOMER_COMPANY || 'Walk-in'
+  },
+  require_approval: process.env.AUTO_CREATE_REQUIRE_APPROVAL === 'true'
+};
+
 // Email configuration - FIXED: createTransport not createTransporter
 const emailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -1185,6 +1196,371 @@ app.get('/api/notifications', authenticateToken, requireAdmin, async (req, res) 
 });
 
 // Start server
+// ===== BARCODE SCANNER ENDPOINTS - ADD THIS SECTION =====
+
+// Barcode validation helper
+const validateBarcode = (barcode) => {
+  // 8-character alphanumeric pattern
+  const pattern = /^[A-Z0-9]{8}$/;
+  return pattern.test(barcode.toUpperCase());
+};
+
+// Parse barcode ranges (e.g., "AB123001-AB123005" or "AB123001,AB123002,AB123003")
+const parseBarcodeInput = (input) => {
+  const barcodes = [];
+  const parts = input.split(',').map(s => s.trim());
+  
+  for (const part of parts) {
+    if (part.includes('-')) {
+      // Handle range (e.g., AB123001-AB123005)
+      const [start, end] = part.split('-').map(s => s.trim());
+      
+      if (!validateBarcode(start) || !validateBarcode(end)) {
+        throw new Error(`Invalid barcode range: ${part}`);
+      }
+      
+      // Extract prefix and numeric part
+      const startPrefix = start.substring(0, 2);
+      const endPrefix = end.substring(0, 2);
+      
+      if (startPrefix !== endPrefix) {
+        throw new Error(`Range prefixes must match: ${start} to ${end}`);
+      }
+      
+      const startNum = parseInt(start.substring(2));
+      const endNum = parseInt(end.substring(2));
+      
+      if (startNum > endNum) {
+        throw new Error(`Invalid range: start number must be less than end number`);
+      }
+      
+      // Generate range
+      for (let i = startNum; i <= endNum; i++) {
+        const barcode = startPrefix + i.toString().padStart(6, '0');
+        barcodes.push(barcode);
+      }
+    } else {
+      // Single barcode
+      if (!validateBarcode(part)) {
+        throw new Error(`Invalid barcode format: ${part}`);
+      }
+      barcodes.push(part.toUpperCase());
+    }
+  }
+  
+  return barcodes;
+};
+
+// Get barcode scanner status
+app.get('/api/scanner/status', authenticateToken, (req, res) => {
+  res.json({
+    hardware_connected: false, // Will be true when Socket S700 is connected
+    last_scan: null,
+    scan_count: 0,
+    scanner_type: 'Socket S700',
+    manual_entry_enabled: true,
+    batch_entry_enabled: true
+  });
+});
+
+// Validate barcode format
+app.post('/api/scanner/validate', authenticateToken, async (req, res) => {
+  try {
+    const { barcode } = req.body;
+    
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode is required' });
+    }
+    
+    const isValid = validateBarcode(barcode);
+    
+    if (!isValid) {
+      return res.json({
+        valid: false,
+        error: 'Barcode must be 8 alphanumeric characters',
+        format: 'AB123456 or 12345678'
+      });
+    }
+    
+    // Check if barcode already exists
+    const existingSample = await query(
+      'SELECT s.*, o.order_number, c.name as customer_name FROM samples s LEFT JOIN orders o ON s.order_id = o.id LEFT JOIN customers c ON o.customer_id = c.id WHERE s.barcode = $1',
+      [barcode.toUpperCase()]
+    );
+    
+    res.json({
+      valid: true,
+      barcode: barcode.toUpperCase(),
+      exists: existingSample.rows.length > 0,
+      sample_info: existingSample.rows[0] || null
+    });
+    
+  } catch (error) {
+    console.error('Barcode validation error:', error);
+    res.status(500).json({ error: 'Failed to validate barcode' });
+  }
+});
+
+// Batch validate barcodes (supports ranges and lists)
+app.post('/api/scanner/validate-batch', authenticateToken, async (req, res) => {
+  try {
+    const { input } = req.body;
+    
+    if (!input) {
+      return res.status(400).json({ error: 'Input is required' });
+    }
+    
+    const barcodes = parseBarcodeInput(input);
+    const results = [];
+    
+    for (const barcode of barcodes) {
+      // Check if barcode exists
+      const existingSample = await query(
+        'SELECT s.*, o.order_number, c.name as customer_name FROM samples s LEFT JOIN orders o ON s.order_id = o.id LEFT JOIN customers c ON o.customer_id = c.id WHERE s.barcode = $1',
+        [barcode]
+      );
+      
+      results.push({
+        barcode,
+        valid: true,
+        exists: existingSample.rows.length > 0,
+        sample_info: existingSample.rows[0] || null
+      });
+    }
+    
+    res.json({
+      total_barcodes: barcodes.length,
+      valid_barcodes: barcodes.length,
+      existing_samples: results.filter(r => r.exists).length,
+      new_samples: results.filter(r => !r.exists).length,
+      results
+    });
+    
+  } catch (error) {
+    console.error('Batch barcode validation error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Enhanced receive sample by barcode
+app.post('/api/scanner/receive-sample', authenticateToken, async (req, res) => {
+  try {
+    const { barcode, location = 'Main Lab', notes = '', auto_create_order = false } = req.body;
+    
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode is required' });
+    }
+    
+    const normalizedBarcode = barcode.toUpperCase();
+    
+    // Find sample
+let sampleResult = await query(`
+  SELECT s.*, o.order_number, o.customer_id, c.name as customer_name, c.company_name
+  FROM samples s
+  LEFT JOIN orders o ON s.order_id = o.id
+  LEFT JOIN customers c ON o.customer_id = c.id
+  WHERE s.barcode = $1
+`, [normalizedBarcode]);
+
+if (sampleResult.rows.length === 0) {
+  if (auto_create_order) {
+    if (!AUTO_CREATE_CONFIG.enabled) {
+      return res.status(403).json({ 
+        error: 'Auto-create orders is disabled',
+        suggestion: 'Contact administrator to enable this feature'
+      });
+    }
+
+    // Find or create default customer using config
+    let defaultCustomer = await query(`
+      SELECT id FROM customers 
+      WHERE email = $1
+      LIMIT 1
+    `, [AUTO_CREATE_CONFIG.default_customer.email]);
+    
+    let customerId;
+    if (defaultCustomer.rows.length === 0) {
+      const customerResult = await query(`
+        INSERT INTO customers (name, email, company_name, created_by)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+      `, [
+        AUTO_CREATE_CONFIG.default_customer.name,
+        AUTO_CREATE_CONFIG.default_customer.email,
+        AUTO_CREATE_CONFIG.default_customer.company,
+        req.user.userId
+      ]);
+      customerId = customerResult.rows[0].id;
+    } else {
+      customerId = defaultCustomer.rows[0].id;
+    }
+
+    // Create order with better naming
+    const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const orderNumber = `AUTO-${timestamp}-${normalizedBarcode}`;
+    
+    const orderResult = await query(`
+      INSERT INTO orders (
+        customer_id, order_number, sample_count, status, 
+        priority, notes, created_by
+      ) VALUES ($1, $2, 1, $3, $4, $5, $6)
+      RETURNING *
+    `, [
+      customerId, 
+      orderNumber, 
+      AUTO_CREATE_CONFIG.require_approval ? 'pending_approval' : 'received_customer',
+      'urgent',
+      `Auto-created for unknown barcode: ${normalizedBarcode}. Received by: ${req.user.username}`,
+      req.user.userId
+    ]);
+
+    // Create sample
+    const newSampleResult = await query(`
+      INSERT INTO samples (order_id, barcode, sample_type, status, location, notes, received_at, received_by)
+      VALUES ($1, $2, 'environmental', 'received', $3, $4, CURRENT_TIMESTAMP, $5)
+      RETURNING *
+    `, [orderResult.rows[0].id, normalizedBarcode, location, notes, req.user.userId]);
+    
+    await logAudit(req.user.userId, 'CREATE', 'sample', newSampleResult.rows[0].id, 
+      `Auto-created sample for unknown barcode: ${normalizedBarcode}`);
+    
+    return res.json({
+      message: 'Sample received and auto-created',
+      sample: newSampleResult.rows[0],
+      order: orderResult.rows[0],
+      auto_created: true
+    });
+  } else {
+    return res.status(404).json({ 
+      error: 'Sample not found',
+      barcode: normalizedBarcode,
+      suggestion: 'Enable auto-create mode or assign barcode to an order first'
+    });
+  }
+}
+    
+    const sample = sampleResult.rows[0];
+    
+    // Check if already received
+    if (sample.status === 'received' || sample.received_at) {
+      return res.json({
+        message: 'Sample was already received',
+        sample,
+        previously_received: true,
+        received_at: sample.received_at
+      });
+    }
+    
+    // Update sample status to received
+    await query(`
+      UPDATE samples SET 
+        status = 'received',
+        received_at = CURRENT_TIMESTAMP,
+        received_by = $1,
+        location = $2,
+        notes = COALESCE(notes || ' | ', '') || $3
+      WHERE id = $4
+    `, [req.user.userId, location, notes, sample.id]);
+    
+    await logAudit(req.user.userId, 'RECEIVE', 'sample', sample.id, 
+      `Received sample: ${normalizedBarcode}`);
+    
+    // Get updated sample info
+    const updatedSampleResult = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name, c.company_name,
+             u.full_name as received_by_name
+      FROM samples s
+      LEFT JOIN orders o ON s.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN users u ON s.received_by = u.id
+      WHERE s.id = $1
+    `, [sample.id]);
+    
+    res.json({
+      message: 'Sample received successfully',
+      sample: updatedSampleResult.rows[0],
+      auto_created: false
+    });
+    
+  } catch (error) {
+    console.error('Sample receive error:', error);
+    res.status(500).json({ error: 'Failed to receive sample' });
+  }
+});
+
+// Search samples by barcode pattern
+app.get('/api/scanner/search', authenticateToken, async (req, res) => {
+  try {
+    const { q, limit = 20, status } = req.query;
+    
+    if (!q || q.length < 2) {
+      return res.json({ samples: [] });
+    }
+    
+    let query_text = `
+      SELECT s.*, o.order_number, c.name as customer_name, c.company_name,
+             u.full_name as received_by_name
+      FROM samples s
+      LEFT JOIN orders o ON s.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN users u ON s.received_by = u.id
+      WHERE s.barcode ILIKE $1
+    `;
+    
+    const params = [`%${q.toUpperCase()}%`];
+    
+    if (status) {
+      query_text += ` AND s.status = $${params.length + 1}`;
+      params.push(status);
+    }
+    
+    query_text += ` ORDER BY s.created_at DESC LIMIT $${params.length + 1}`;
+    params.push(limit);
+    
+    const result = await query(query_text, params);
+    
+    res.json({
+      samples: result.rows,
+      count: result.rows.length
+    });
+    
+  } catch (error) {
+    console.error('Sample search error:', error);
+    res.status(500).json({ error: 'Failed to search samples' });
+  }
+});
+
+// Get recent scan activity
+app.get('/api/scanner/recent-activity', authenticateToken, async (req, res) => {
+  try {
+    const limit = req.query.limit || 20;
+    
+    const result = await query(`
+      SELECT s.barcode, s.status, s.received_at, s.location,
+             o.order_number, c.name as customer_name,
+             u.full_name as received_by_name,
+             'sample_received' as activity_type
+      FROM samples s
+      LEFT JOIN orders o ON s.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
+      LEFT JOIN users u ON s.received_by = u.id
+      WHERE s.received_at IS NOT NULL
+      ORDER BY s.received_at DESC
+      LIMIT $1
+    `, [limit]);
+    
+    res.json({
+      activity: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Recent activity fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch recent activity' });
+  }
+});
+
+// ===== END BARCODE SCANNER ENDPOINTS =====
+
 app.listen(PORT, async () => {
   console.log(`3R Testing LIMS Server running on port ${PORT}`);
   console.log(`Database type: PostgreSQL`);
