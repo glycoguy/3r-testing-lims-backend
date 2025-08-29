@@ -19,17 +19,6 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Auto Order Creation
-const AUTO_CREATE_CONFIG = {
-  enabled: process.env.AUTO_CREATE_ORDERS === 'true',
-  default_customer: {
-    name: process.env.DEFAULT_CUSTOMER_NAME || 'Walk-in Customer',
-    email: process.env.DEFAULT_CUSTOMER_EMAIL || 'walkin@3rtesting.com',
-    company: process.env.DEFAULT_CUSTOMER_COMPANY || 'Walk-in'
-  },
-  require_approval: process.env.AUTO_CREATE_REQUIRE_APPROVAL === 'true'
-};
-
 // Email configuration
 const emailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -40,39 +29,6 @@ const emailTransporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS || 'your-app-password'
   }
 });
-
-// Shipping Configuration
-const SHIPPING_CONFIG = {
-  default_carrier: 'UPS',
-  default_service: 'Ground',
-  shipengine_api_key: process.env.SHIPENGINE_API_KEY,
-  easypost_api_key: process.env.EASYPOST_API_KEY,
-  ups_api_key: process.env.UPS_API_KEY,
-  fedex_api_key: process.env.FEDEX_API_KEY,
-  from_address: {
-    name: '3R Testing Laboratory',
-    company: '3R Testing',
-    address_line_1: process.env.LAB_ADDRESS_LINE1 || '123 Lab Street',
-    city: process.env.LAB_CITY || 'Science City',
-    state: process.env.LAB_STATE || 'SC',
-    postal_code: process.env.LAB_ZIP || '12345',
-    country: 'US',
-    phone: process.env.LAB_PHONE || '555-123-4567'
-  }
-};
-
-// WooCommerce Configuration
-const WOOCOMMERCE_WEBHOOK_SECRET = process.env.WOOCOMMERCE_WEBHOOK_SECRET;
-
-// Product mapping configuration
-const PRODUCT_SAMPLE_MAPPING = {
-  'pathogen-test-single': { sample_count: 1, test_type: 'HLVD' },
-  'pathogen-test-5pack': { sample_count: 5, test_type: 'HLVD' },
-  'pathogen-test-10pack': { sample_count: 10, test_type: 'HLVD' },
-  'fusarium-test': { sample_count: 1, test_type: 'Fusarium' },
-  'pythium-test': { sample_count: 1, test_type: 'Pythium' },
-  'combo-test': { sample_count: 1, test_type: 'Fus+Pyth' }
-};
 
 // Middleware
 app.use(cors({
@@ -143,254 +99,10 @@ const logAudit = async (userId, action, entityType, entityId, details = null) =>
   }
 };
 
-// Check if column exists helper
-const columnExists = async (tableName, columnName) => {
-  try {
-    const result = await query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.columns 
-        WHERE table_name = $1 AND column_name = $2
-      );
-    `, [tableName, columnName]);
-    return result.rows[0].exists;
-  } catch (error) {
-    return false;
-  }
-};
-
 // Barcode validation helper
 const validateBarcode = (barcode) => {
   const pattern = /^[A-Z0-9]{8}$/;
   return pattern.test(barcode.toUpperCase());
-};
-
-// Parse barcode ranges
-const parseBarcodeInput = (input) => {
-  const barcodes = [];
-  const parts = input.split(',').map(s => s.trim());
-  
-  for (const part of parts) {
-    if (part.includes('-')) {
-      const [start, end] = part.split('-').map(s => s.trim());
-      
-      if (!validateBarcode(start) || !validateBarcode(end)) {
-        throw new Error(`Invalid barcode range: ${part}`);
-      }
-      
-      const startPrefix = start.substring(0, 2);
-      const endPrefix = end.substring(0, 2);
-      
-      if (startPrefix !== endPrefix) {
-        throw new Error(`Range prefixes must match: ${start} to ${end}`);
-      }
-      
-      const startNum = parseInt(start.substring(2));
-      const endNum = parseInt(end.substring(2));
-      
-      if (startNum > endNum) {
-        throw new Error(`Invalid range: start number must be less than end number`);
-      }
-      
-      for (let i = startNum; i <= endNum; i++) {
-        const barcode = startPrefix + i.toString().padStart(6, '0');
-        barcodes.push(barcode);
-      }
-    } else {
-      if (!validateBarcode(part)) {
-        throw new Error(`Invalid barcode format: ${part}`);
-      }
-      barcodes.push(part.toUpperCase());
-    }
-  }
-  
-  return barcodes;
-};
-
-// Helper functions for WooCommerce
-const findOrCreateCustomer = async (wooCustomerData) => {
-  try {
-    if (wooCustomerData.id) {
-      const existingCustomer = await query(
-        'SELECT * FROM customers WHERE woocommerce_id = $1',
-        [wooCustomerData.id]
-      );
-      
-      if (existingCustomer.rows.length > 0) {
-        return existingCustomer.rows[0];
-      }
-    }
-    
-    const existingByEmail = await query(
-      'SELECT * FROM customers WHERE email = $1',
-      [wooCustomerData.email]
-    );
-    
-    if (existingByEmail.rows.length > 0) {
-      return existingByEmail.rows[0];
-    }
-    
-    const customerResult = await query(`
-      INSERT INTO customers (
-        name, email, company_name, phone, 
-        shipping_address, billing_address,
-        woocommerce_id, woocommerce_username,
-        created_by
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
-    `, [
-      `${wooCustomerData.first_name} ${wooCustomerData.last_name}`.trim(),
-      wooCustomerData.email,
-      wooCustomerData.billing?.company || null,
-      wooCustomerData.billing?.phone || null,
-      formatAddress(wooCustomerData.shipping),
-      formatAddress(wooCustomerData.billing),
-      wooCustomerData.id || null,
-      wooCustomerData.username || null,
-      1
-    ]);
-    
-    return customerResult.rows[0];
-  } catch (error) {
-    console.error('Error finding/creating customer:', error);
-    throw error;
-  }
-};
-
-const formatAddress = (addressData) => {
-  if (!addressData) return null;
-  
-  const parts = [
-    addressData.address_1,
-    addressData.address_2,
-    addressData.city,
-    addressData.state,
-    addressData.postcode,
-    addressData.country
-  ].filter(Boolean);
-  
-  return parts.join(', ');
-};
-
-const parseOrderLineItems = (lineItems) => {
-  let totalSampleCount = 0;
-  let testTypes = new Set();
-  
-  lineItems.forEach(item => {
-    const sku = item.sku || item.product_id?.toString();
-    const mapping = PRODUCT_SAMPLE_MAPPING[sku];
-    
-    if (mapping) {
-      totalSampleCount += mapping.sample_count * item.quantity;
-      testTypes.add(mapping.test_type);
-    } else {
-      totalSampleCount += item.quantity;
-      testTypes.add('HLVD');
-    }
-  });
-  
-  return {
-    sample_count: totalSampleCount,
-    test_type: testTypes.size === 1 ? Array.from(testTypes)[0] : 'MIXED'
-  };
-};
-
-// PDF Generation Function
-const generateResultsPDF = async (orderId) => {
-  try {
-    // Get order details with all samples and results
-    const orderResult = await query(`
-      SELECT o.*, c.name as customer_name, c.email as customer_email,
-             c.company_name, c.shipping_address
-      FROM orders o
-      JOIN customers c ON o.customer_id = c.id
-      WHERE o.id = $1
-    `, [orderId]);
-    
-    if (orderResult.rows.length === 0) {
-      throw new Error('Order not found');
-    }
-    
-    const order = orderResult.rows[0];
-    
-    // Get samples with results
-    const samplesResult = await query(`
-      SELECT s.*, tr.test_type, tr.result, tr.value, tr.units, 
-             tr.detection_limit, tr.method, tr.analyst, tr.analyzed_at
-      FROM samples s
-      LEFT JOIN test_results tr ON s.id = tr.sample_id
-      WHERE s.order_id = $1
-      ORDER BY s.barcode
-    `, [orderId]);
-    
-    const samples = samplesResult.rows;
-    
-    // Create PDF
-    const doc = new PDFDocument();
-    let buffers = [];
-    
-    doc.on('data', buffers.push.bind(buffers));
-    
-    return new Promise((resolve, reject) => {
-      doc.on('end', () => {
-        const pdfBuffer = Buffer.concat(buffers);
-        resolve(pdfBuffer);
-      });
-      
-      // PDF Header
-      doc.fontSize(20).text('3R Testing Laboratory', 50, 50);
-      doc.fontSize(16).text('Pathogen Testing Results Report', 50, 80);
-      doc.fontSize(12).text(`Report Generated: ${new Date().toLocaleDateString()}`, 50, 110);
-      
-      // Order Information
-      doc.fontSize(14).text('Order Information', 50, 150);
-      doc.fontSize(10)
-         .text(`Order Number: ${order.order_number}`, 50, 170)
-         .text(`Customer: ${order.customer_name}`, 50, 185)
-         .text(`Company: ${order.company_name || 'N/A'}`, 50, 200)
-         .text(`Test Type: ${order.test_type || 'Various'}`, 50, 215);
-      
-      // Results Table
-      let yPosition = 250;
-      doc.fontSize(14).text('Test Results', 50, yPosition);
-      yPosition += 25;
-      
-      // Table headers
-      doc.fontSize(9)
-         .text('Barcode', 50, yPosition)
-         .text('Test Type', 150, yPosition)
-         .text('Result', 250, yPosition)
-         .text('Value', 320, yPosition)
-         .text('Method', 400, yPosition);
-      
-      yPosition += 20;
-      
-      // Results data
-      samples.forEach(sample => {
-        if (yPosition > 700) {
-          doc.addPage();
-          yPosition = 50;
-        }
-        
-        doc.text(sample.barcode, 50, yPosition)
-           .text(sample.test_type || 'N/A', 150, yPosition)
-           .text(sample.result || 'Pending', 250, yPosition)
-           .text(sample.value ? `${sample.value} ${sample.units || ''}` : 'N/A', 320, yPosition)
-           .text(sample.method || 'N/A', 400, yPosition);
-        
-        yPosition += 15;
-      });
-      
-      // Footer
-      doc.fontSize(8)
-         .text('3R Testing Laboratory - Certified Pathogen Testing', 50, 750)
-         .text('This report is confidential and intended for the named recipient only.', 50, 765);
-      
-      doc.end();
-    });
-    
-  } catch (error) {
-    console.error('PDF generation error:', error);
-    throw error;
-  }
 };
 
 // Initialize database tables
@@ -564,10 +276,10 @@ async function initializeDatabase() {
       }
     }
 
-    console.log('✅ Database tables initialized successfully');
+    console.log('Database tables initialized successfully');
     
   } catch (error) {
-    console.error('❌ Database initialization failed:', error);
+    console.error('Database initialization failed:', error);
     throw error;
   }
 }
@@ -579,21 +291,11 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     message: '3R Testing LIMS Backend is running',
     database: 'PostgreSQL',
-    version: '3.0.0 - Complete Integration',
-    features: [
-      'email_notifications', 
-      'pdf_reports', 
-      'customer_portal',
-      'woocommerce_integration',
-      'flexible_shipping',
-      'barcode_scanning',
-      'batch_processing'
-    ]
+    version: '3.0.0'
   });
 });
 
-// ===== AUTHENTICATION ENDPOINTS =====
-
+// Authentication endpoints
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -630,291 +332,6 @@ app.post('/api/auth/login', async (req, res) => {
     );
     
     res.json({
-      message: 'Sample received successfully',
-      sample: updatedSampleResult.rows[0],
-      auto_created: false
-    });
-    
-  } catch (error) {
-    console.error('Sample receive error:', error);
-    res.status(500).json({ error: 'Failed to receive sample' });
-  }
-});
-
-app.get('/api/scanner/search', authenticateToken, async (req, res) => {
-  try {
-    const { q, limit = 20, status } = req.query;
-    
-    if (!q || q.length < 2) {
-      return res.json({ samples: [] });
-    }
-    
-    let query_text = `
-      SELECT s.*, o.order_number, c.name as customer_name, c.company_name,
-             u.full_name as received_by_name
-      FROM samples s
-      LEFT JOIN orders o ON s.order_id = o.id
-      LEFT JOIN customers c ON o.customer_id = c.id
-      LEFT JOIN users u ON s.received_by = u.id
-      WHERE s.barcode ILIKE $1
-    `;
-    
-    const params = [`%${q.toUpperCase()}%`];
-    
-    if (status) {
-      query_text += ` AND s.status = ${params.length + 1}`;
-      params.push(status);
-    }
-    
-    query_text += ` ORDER BY s.created_at DESC LIMIT ${params.length + 1}`;
-    params.push(limit);
-    
-    const result = await query(query_text, params);
-    
-    res.json({
-      samples: result.rows,
-      count: result.rows.length
-    });
-    
-  } catch (error) {
-    console.error('Sample search error:', error);
-    res.status(500).json({ error: 'Failed to search samples' });
-  }
-});
-
-app.get('/api/scanner/recent-activity', authenticateToken, async (req, res) => {
-  try {
-    const limit = req.query.limit || 20;
-    
-    const result = await query(`
-      SELECT s.barcode, s.status, s.received_at, s.location,
-             o.order_number, c.name as customer_name,
-             u.full_name as received_by_name,
-             'sample_received' as activity_type
-      FROM samples s
-      LEFT JOIN orders o ON s.order_id = o.id
-      LEFT JOIN customers c ON o.customer_id = c.id
-      LEFT JOIN users u ON s.received_by = u.id
-      WHERE s.received_at IS NOT NULL
-      ORDER BY s.received_at DESC
-      LIMIT $1
-    `, [limit]);
-    
-    res.json({
-      activity: result.rows
-    });
-    
-  } catch (error) {
-    console.error('Recent activity fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch recent activity' });
-  }
-});
-
-// ===== EMAIL FUNCTIONS =====
-
-const sendResultsEmail = async (orderId) => {
-  try {
-    // Get order and customer details
-    const orderResult = await query(`
-      SELECT o.*, c.name as customer_name, c.email as customer_email
-      FROM orders o
-      JOIN customers c ON o.customer_id = c.id
-      WHERE o.id = $1
-    `, [orderId]);
-    
-    if (orderResult.rows.length === 0) {
-      throw new Error('Order not found');
-    }
-    
-    const order = orderResult.rows[0];
-    
-    // Generate PDF
-    const pdfBuffer = await generateResultsPDF(orderId);
-    
-    // Send email with PDF attachment
-    const mailOptions = {
-      from: process.env.SMTP_USER || 'noreply@3rtesting.com',
-      to: order.customer_email,
-      subject: `Test Results Ready - Order ${order.order_number}`,
-      html: `
-        <div style="font-family: Arial, sans-serif;">
-          <h2>Test Results Ready</h2>
-          <p>Dear ${order.customer_name},</p>
-          <p>Your pathogen testing results for order <strong>${order.order_number}</strong> are now complete.</p>
-          <p>Please find your detailed results report attached as a PDF.</p>
-          <p>If you have any questions about your results, please don't hesitate to contact us.</p>
-          <br>
-          <p>Best regards,<br>3R Testing Laboratory</p>
-        </div>
-      `,
-      attachments: [
-        {
-          filename: `3R_Testing_Results_${order.order_number}.pdf`,
-          content: pdfBuffer,
-          contentType: 'application/pdf'
-        }
-      ]
-    };
-    
-    await emailTransporter.sendMail(mailOptions);
-    
-    // Log notification
-    await query(`
-      INSERT INTO email_notifications (
-        order_id, notification_type, recipient_email, recipient_name,
-        subject, status, sent_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
-    `, [
-      orderId,
-      'results_ready',
-      order.customer_email,
-      order.customer_name,
-      `Test Results Ready - Order ${order.order_number}`,
-      'sent'
-    ]);
-    
-    console.log(`Results email sent for order ${order.order_number}`);
-    
-  } catch (error) {
-    console.error('Email sending error:', error);
-    
-    // Log failed notification
-    try {
-      await query(`
-        INSERT INTO email_notifications (
-          order_id, notification_type, recipient_email, recipient_name,
-          subject, status, error_message
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `, [
-        orderId,
-        'results_ready',
-        'unknown@error.com',
-        'Unknown Customer',
-        `Test Results Ready - Order ${orderId}`,
-        'failed',
-        error.message
-      ]);
-    } catch (logError) {
-      console.error('Failed to log email error:', logError);
-    }
-    
-    throw error;
-  }
-};
-
-// ===== WOOCOMMERCE WEBHOOK =====
-
-app.post('/api/webhooks/woocommerce', async (req, res) => {
-  try {
-    const signature = req.headers['x-wc-webhook-signature'];
-    const body = req.body;
-    
-    // Skip signature verification in development
-    if (WOOCOMMERCE_WEBHOOK_SECRET) {
-      const expectedSignature = crypto
-        .createHmac('sha256', WOOCOMMERCE_WEBHOOK_SECRET)
-        .update(body)
-        .digest('base64');
-      
-      if (signature !== expectedSignature) {
-        console.error('Invalid WooCommerce webhook signature');
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
-    }
-    
-    const orderData = JSON.parse(body.toString());
-    
-    // Only process completed/processing orders
-    if (!['completed', 'processing', 'paid'].includes(orderData.status)) {
-      return res.status(200).json({ message: 'Order status not eligible for processing' });
-    }
-    
-    // Check if order already exists
-    const existingOrder = await query(
-      'SELECT * FROM orders WHERE woocommerce_order_id = $1',
-      [orderData.id]
-    );
-    
-    if (existingOrder.rows.length > 0) {
-      return res.status(200).json({ message: 'Order already exists' });
-    }
-    
-    // Find or create customer
-    const customer = await findOrCreateCustomer({
-      id: orderData.customer_id,
-      email: orderData.billing.email,
-      first_name: orderData.billing.first_name,
-      last_name: orderData.billing.last_name,
-      username: orderData.customer_id ? `customer_${orderData.customer_id}` : null,
-      billing: orderData.billing,
-      shipping: orderData.shipping
-    });
-    
-    // Parse line items
-    const orderDetails = parseOrderLineItems(orderData.line_items);
-    
-    // Create LIMS order
-    const orderResult = await query(`
-      INSERT INTO orders (
-        customer_id, order_number, sample_count, test_type,
-        status, woocommerce_order_id, woocommerce_status,
-        shipping_method, priority, notes, created_by
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *
-    `, [
-      customer.id,
-      `WOO-${orderData.id}`,
-      orderDetails.sample_count,
-      orderDetails.test_type,
-      'pending',
-      orderData.id,
-      orderData.status,
-      'ups_ground',
-      orderData.total > 100 ? 'high' : 'normal',
-      `Auto-created from WooCommerce order #${orderData.id}. Total: ${orderData.total}`,
-      1
-    ]);
-    
-    const limsOrder = orderResult.rows[0];
-    
-    // Create placeholder samples
-    for (let i = 1; i <= orderDetails.sample_count; i++) {
-      const barcode = `WOO-${orderData.id}-S${i.toString().padStart(2, '0')}`;
-      await query(
-        'INSERT INTO samples (order_id, barcode, sample_type, status) VALUES ($1, $2, $3, $4)',
-        [limsOrder.id, barcode, orderDetails.test_type, 'pending']
-      );
-    }
-    
-    await logAudit(1, 'CREATE', 'order', limsOrder.id, `Auto-created from WooCommerce order #${orderData.id}`);
-    
-    res.status(200).json({ 
-      message: 'Order processed successfully',
-      lims_order_id: limsOrder.id,
-      lims_order_number: limsOrder.order_number
-    });
-    
-  } catch (error) {
-    console.error('WooCommerce webhook processing error:', error);
-    res.status(500).json({ error: 'Failed to process order' });
-  }
-});
-
-// Start server
-app.listen(PORT, async () => {
-  console.log(`3R Testing LIMS Server running on port ${PORT}`);
-  console.log(`Database type: PostgreSQL`);
-  console.log(`Version: 3.0.0 - Complete Integration`);
-  console.log(`WooCommerce webhook: ${WOOCOMMERCE_WEBHOOK_SECRET ? 'Configured' : 'Not configured'}`);
-  
-  try {
-    await initializeDatabase();
-  } catch (error) {
-    console.error('Failed to initialize database:', error);
-    process.exit(1);
-  }
-});
-
-module.exports = app;
       token,
       user: {
         id: user.id,
@@ -935,7 +352,6 @@ app.post('/api/auth/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
 });
 
-// MISSING ENDPOINT: Change password
 app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -948,7 +364,6 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 6 characters' });
     }
     
-    // Verify current password
     const userResult = await query('SELECT password_hash FROM users WHERE id = $1', [req.user.userId]);
     const user = userResult.rows[0];
     
@@ -957,7 +372,6 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: 'Current password is incorrect' });
     }
     
-    // Update password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     await query(
       'UPDATE users SET password_hash = $1, password_changed_at = CURRENT_TIMESTAMP WHERE id = $2',
@@ -974,8 +388,7 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   }
 });
 
-// ===== CUSTOMER ENDPOINTS =====
-
+// Customer endpoints
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -1026,8 +439,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
   }
 });
 
-// ===== ORDER ENDPOINTS =====
-
+// Order endpoints
 app.get('/api/orders', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -1069,7 +481,6 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     
     const order = result.rows[0];
     
-    // Create placeholder samples
     for (let i = 1; i <= sample_count; i++) {
       const barcode = `${orderNumber}-S${i.toString().padStart(2, '0')}`;
       await query(
@@ -1087,7 +498,6 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
   }
 });
 
-// MISSING ENDPOINT: Assign barcodes to order
 app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1097,7 +507,6 @@ app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) 
       return res.status(400).json({ error: 'Barcodes array is required' });
     }
     
-    // Get order details
     const orderResult = await query('SELECT * FROM orders WHERE id = $1', [id]);
     if (orderResult.rows.length === 0) {
       return res.status(404).json({ error: 'Order not found' });
@@ -1111,10 +520,8 @@ app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) 
       });
     }
     
-    // Delete existing samples for this order
     await query('DELETE FROM samples WHERE order_id = $1', [id]);
     
-    // Create new samples with assigned barcodes
     for (let i = 0; i < barcodes.length; i++) {
       const barcode = barcodes[i].toUpperCase().trim();
       
@@ -1138,16 +545,75 @@ app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) 
   }
 });
 
-// MISSING ENDPOINT: Download PDF report
 app.get('/api/orders/:id/pdf', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     
-    const pdfBuffer = await generateResultsPDF(id);
+    const orderResult = await query(`
+      SELECT o.*, c.name as customer_name, c.email as customer_email,
+             c.company_name, c.shipping_address
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      WHERE o.id = $1
+    `, [id]);
     
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="3R_Testing_Results_${id}.pdf"`);
-    res.send(pdfBuffer);
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const order = orderResult.rows[0];
+    
+    const samplesResult = await query(`
+      SELECT s.*, tr.test_type, tr.result, tr.value, tr.units
+      FROM samples s
+      LEFT JOIN test_results tr ON s.id = tr.sample_id
+      WHERE s.order_id = $1
+      ORDER BY s.barcode
+    `, [id]);
+    
+    const samples = samplesResult.rows;
+    
+    const doc = new PDFDocument();
+    let buffers = [];
+    
+    doc.on('data', buffers.push.bind(buffers));
+    doc.on('end', () => {
+      const pdfBuffer = Buffer.concat(buffers);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="3R_Testing_Results_${order.order_number}.pdf"`);
+      res.send(pdfBuffer);
+    });
+    
+    doc.fontSize(20).text('3R Testing Laboratory', 50, 50);
+    doc.fontSize(16).text('Pathogen Testing Results Report', 50, 80);
+    doc.fontSize(12).text(`Report Generated: ${new Date().toLocaleDateString()}`, 50, 110);
+    
+    doc.fontSize(14).text('Order Information', 50, 150);
+    doc.fontSize(10)
+       .text(`Order Number: ${order.order_number}`, 50, 170)
+       .text(`Customer: ${order.customer_name}`, 50, 185)
+       .text(`Company: ${order.company_name || 'N/A'}`, 50, 200);
+    
+    let yPosition = 250;
+    doc.fontSize(14).text('Test Results', 50, yPosition);
+    yPosition += 25;
+    
+    doc.fontSize(9)
+       .text('Barcode', 50, yPosition)
+       .text('Test Type', 150, yPosition)
+       .text('Result', 250, yPosition);
+    
+    yPosition += 20;
+    
+    samples.forEach(sample => {
+      doc.text(sample.barcode, 50, yPosition)
+         .text(sample.test_type || 'N/A', 150, yPosition)
+         .text(sample.result || 'Pending', 250, yPosition);
+      
+      yPosition += 15;
+    });
+    
+    doc.end();
     
   } catch (error) {
     console.error('PDF download error:', error);
@@ -1155,8 +621,7 @@ app.get('/api/orders/:id/pdf', authenticateToken, async (req, res) => {
   }
 });
 
-// ===== SAMPLE ENDPOINTS =====
-
+// Sample endpoints
 app.get('/api/samples', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -1224,7 +689,6 @@ app.post('/api/samples/receive', authenticateToken, async (req, res) => {
   }
 });
 
-// MISSING ENDPOINT: Update sample status
 app.patch('/api/samples/:id/status', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1234,7 +698,7 @@ app.patch('/api/samples/:id/status', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Status is required' });
     }
     
-    let updateQuery = 'UPDATE samples SET status = $1, updated_at = CURRENT_TIMESTAMP';
+    let updateQuery = 'UPDATE samples SET status = $1';
     let params = [status];
     let paramCount = 1;
     
@@ -1279,7 +743,6 @@ app.patch('/api/samples/:id/status', authenticateToken, async (req, res) => {
   }
 });
 
-// MISSING ENDPOINT: Add test results
 app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1289,7 +752,6 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Test type and result are required' });
     }
     
-    // Add test result
     const resultRecord = await query(`
       INSERT INTO test_results (
         sample_id, test_type, result, value, units, 
@@ -1297,7 +759,6 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
     `, [id, test_type, result, value, units, detection_limit, method, req.user.username, notes]);
     
-    // Update sample status to complete
     await query(`
       UPDATE samples SET 
         status = 'complete',
@@ -1306,7 +767,6 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
       WHERE id = $2
     `, [req.user.userId, id]);
     
-    // Check if all samples in order are complete
     const sampleResult = await query('SELECT order_id FROM samples WHERE id = $1', [id]);
     const orderId = sampleResult.rows[0].order_id;
     
@@ -1316,16 +776,7 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
     );
     
     if (parseInt(incompleteSamples.rows[0].count) === 0) {
-      // All samples complete - update order status and send email
-      await query('UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', 
-        ['complete', orderId]);
-      
-      // Send results email
-      try {
-        await sendResultsEmail(orderId);
-      } catch (emailError) {
-        console.error('Failed to send results email:', emailError);
-      }
+      await query('UPDATE orders SET status = $1 WHERE id = $2', ['complete', orderId]);
     }
     
     await logAudit(req.user.userId, 'CREATE', 'test_result', resultRecord.rows[0].id, 
@@ -1342,8 +793,7 @@ app.post('/api/samples/:id/results', authenticateToken, async (req, res) => {
   }
 });
 
-// ===== BATCH ENDPOINTS =====
-
+// Batch endpoints
 app.get('/api/batches', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -1354,7 +804,7 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
       LEFT JOIN samples s ON b.batch_id = s.batch_id
       LEFT JOIN users u ON b.created_by = u.id
       GROUP BY b.id, u.full_name
-      ORDER BY b.created_at DESC
+      ORDER BY b.started_at DESC
     `);
     
     res.json(result.rows);
@@ -1364,7 +814,6 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
   }
 });
 
-// MISSING ENDPOINT: Create batch
 app.post('/api/batches', authenticateToken, async (req, res) => {
   try {
     const { test_type, sample_ids, notes } = req.body;
@@ -1373,17 +822,14 @@ app.post('/api/batches', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Test type and sample IDs are required' });
     }
     
-    // Generate batch ID
     const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const batchId = `BATCH-${test_type}-${timestamp}-${Date.now().toString().slice(-4)}`;
     
-    // Create batch record
     const batchResult = await query(`
       INSERT INTO batches (batch_id, test_type, sample_count, notes, created_by)
       VALUES ($1, $2, $3, $4, $5) RETURNING *
     `, [batchId, test_type, sample_ids.length, notes, req.user.userId]);
     
-    // Update samples with batch ID and status
     await query(`
       UPDATE samples SET 
         batch_id = $1,
@@ -1407,8 +853,7 @@ app.post('/api/batches', authenticateToken, async (req, res) => {
   }
 });
 
-// ===== USER MANAGEMENT ENDPOINTS =====
-
+// User management endpoints
 app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await query(`
@@ -1425,7 +870,6 @@ app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// MISSING ENDPOINT: Create user
 app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { username, password, role, email, full_name } = req.body;
@@ -1438,13 +882,11 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
     
-    // Check for existing username
     const existingUser = await query('SELECT id FROM users WHERE username = $1', [username]);
     if (existingUser.rows.length > 0) {
       return res.status(409).json({ error: 'Username already exists' });
     }
     
-    // Check for existing email
     const existingEmail = await query('SELECT id FROM users WHERE email = $1', [email]);
     if (existingEmail.rows.length > 0) {
       return res.status(409).json({ error: 'Email already exists' });
@@ -1467,7 +909,6 @@ app.post('/api/users', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// MISSING ENDPOINT: Toggle user status
 app.patch('/api/users/:id/toggle', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1503,8 +944,7 @@ app.patch('/api/users/:id/toggle', authenticateToken, requireAdmin, async (req, 
   }
 });
 
-// ===== DASHBOARD STATS =====
-
+// Dashboard stats
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
     const stats = await Promise.all([
@@ -1533,8 +973,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   }
 });
 
-// ===== ADMIN ENDPOINTS =====
-
+// Admin endpoints
 app.get('/api/audit-log', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const limit = req.query.limit || 50;
@@ -1571,12 +1010,10 @@ app.get('/api/notifications', authenticateToken, requireAdmin, async (req, res) 
   }
 });
 
-// MISSING ENDPOINT: Resend notification
 app.post('/api/notifications/:id/resend', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     
-    // Get notification details
     const notificationResult = await query(`
       SELECT en.*, o.id as order_id
       FROM email_notifications en
@@ -1588,25 +1025,10 @@ app.post('/api/notifications/:id/resend', authenticateToken, requireAdmin, async
       return res.status(404).json({ error: 'Notification not found' });
     }
     
-    const notification = notificationResult.rows[0];
-    
-    // Resend email
-    if (notification.order_id) {
-      await sendResultsEmail(notification.order_id);
-    } else {
-      // Send custom notification
-      await emailTransporter.sendMail({
-        from: process.env.SMTP_USER,
-        to: notification.recipient_email,
-        subject: notification.subject,
-        html: notification.body
-      });
-      
-      await query(
-        'UPDATE email_notifications SET status = $1, sent_at = CURRENT_TIMESTAMP WHERE id = $2',
-        ['sent', id]
-      );
-    }
+    await query(
+      'UPDATE email_notifications SET status = $1, sent_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['sent', id]
+    );
     
     res.json({ message: 'Notification resent successfully' });
     
@@ -1616,10 +1038,9 @@ app.post('/api/notifications/:id/resend', authenticateToken, requireAdmin, async
   }
 });
 
-// Database backup endpoint
+// Backup endpoint
 app.post('/api/backup/create', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    // Simple backup - in production you'd use pg_dump
     const tables = ['users', 'customers', 'orders', 'samples', 'test_results', 'batches'];
     const backupData = {};
     
@@ -1643,8 +1064,7 @@ app.post('/api/backup/create', authenticateToken, requireAdmin, async (req, res)
   }
 });
 
-// ===== SHIPPING ENDPOINTS =====
-
+// Shipping endpoints
 app.post('/api/shipping/manual-tracking', authenticateToken, async (req, res) => {
   try {
     const { order_id, tracking_number, carrier = 'UPS', service = 'Ground', cost = 0 } = req.body;
@@ -1685,8 +1105,7 @@ app.post('/api/shipping/manual-tracking', authenticateToken, async (req, res) =>
   }
 });
 
-// ===== BARCODE SCANNER ENDPOINTS =====
-
+// Barcode scanner endpoints
 app.get('/api/scanner/status', authenticateToken, (req, res) => {
   res.json({
     hardware_connected: false,
@@ -1737,51 +1156,9 @@ app.post('/api/scanner/validate', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/scanner/validate-batch', authenticateToken, async (req, res) => {
-  try {
-    const { input } = req.body;
-    
-    if (!input) {
-      return res.status(400).json({ error: 'Input is required' });
-    }
-    
-    const barcodes = parseBarcodeInput(input);
-    const results = [];
-    
-    for (const barcode of barcodes) {
-      const existingSample = await query(`
-        SELECT s.*, o.order_number, c.name as customer_name 
-        FROM samples s 
-        LEFT JOIN orders o ON s.order_id = o.id 
-        LEFT JOIN customers c ON o.customer_id = c.id 
-        WHERE s.barcode = $1
-      `, [barcode]);
-      
-      results.push({
-        barcode,
-        valid: true,
-        exists: existingSample.rows.length > 0,
-        sample_info: existingSample.rows[0] || null
-      });
-    }
-    
-    res.json({
-      total_barcodes: barcodes.length,
-      valid_barcodes: barcodes.length,
-      existing_samples: results.filter(r => r.exists).length,
-      new_samples: results.filter(r => !r.exists).length,
-      results
-    });
-    
-  } catch (error) {
-    console.error('Batch barcode validation error:', error);
-    res.status(400).json({ error: error.message });
-  }
-});
-
 app.post('/api/scanner/receive-sample', authenticateToken, async (req, res) => {
   try {
-    const { barcode, location = 'Main Lab', notes = '', auto_create_order = false } = req.body;
+    const { barcode, location = 'Main Lab', notes = '' } = req.body;
     
     if (!barcode) {
       return res.status(400).json({ error: 'Barcode is required' });
@@ -1789,8 +1166,8 @@ app.post('/api/scanner/receive-sample', authenticateToken, async (req, res) => {
     
     const normalizedBarcode = barcode.toUpperCase();
     
-    let sampleResult = await query(`
-      SELECT s.*, o.order_number, o.customer_id, c.name as customer_name, c.company_name
+    const sampleResult = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name
       FROM samples s
       LEFT JOIN orders o ON s.order_id = o.id
       LEFT JOIN customers c ON o.customer_id = c.id
@@ -1798,77 +1175,10 @@ app.post('/api/scanner/receive-sample', authenticateToken, async (req, res) => {
     `, [normalizedBarcode]);
 
     if (sampleResult.rows.length === 0) {
-      if (auto_create_order) {
-        if (!AUTO_CREATE_CONFIG.enabled) {
-          return res.status(403).json({ 
-            error: 'Auto-create orders is disabled',
-            suggestion: 'Contact administrator to enable this feature'
-          });
-        }
-
-        let defaultCustomer = await query(`
-          SELECT id FROM customers 
-          WHERE email = $1
-          LIMIT 1
-        `, [AUTO_CREATE_CONFIG.default_customer.email]);
-        
-        let customerId;
-        if (defaultCustomer.rows.length === 0) {
-          const customerResult = await query(`
-            INSERT INTO customers (name, email, company_name, created_by)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-          `, [
-            AUTO_CREATE_CONFIG.default_customer.name,
-            AUTO_CREATE_CONFIG.default_customer.email,
-            AUTO_CREATE_CONFIG.default_customer.company,
-            req.user.userId
-          ]);
-          customerId = customerResult.rows[0].id;
-        } else {
-          customerId = defaultCustomer.rows[0].id;
-        }
-
-        const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-        const orderNumber = `AUTO-${timestamp}-${normalizedBarcode}`;
-        
-        const orderResult = await query(`
-          INSERT INTO orders (
-            customer_id, order_number, sample_count, status, 
-            priority, notes, created_by
-          ) VALUES ($1, $2, 1, $3, $4, $5, $6)
-          RETURNING *
-        `, [
-          customerId, 
-          orderNumber, 
-          AUTO_CREATE_CONFIG.require_approval ? 'pending_approval' : 'received_customer',
-          'urgent',
-          `Auto-created for unknown barcode: ${normalizedBarcode}. Received by: ${req.user.username}`,
-          req.user.userId
-        ]);
-
-        const newSampleResult = await query(`
-          INSERT INTO samples (order_id, barcode, sample_type, status, location, notes, received_at, received_by)
-          VALUES ($1, $2, 'environmental', 'received', $3, $4, CURRENT_TIMESTAMP, $5)
-          RETURNING *
-        `, [orderResult.rows[0].id, normalizedBarcode, location, notes, req.user.userId]);
-        
-        await logAudit(req.user.userId, 'CREATE', 'sample', newSampleResult.rows[0].id, 
-          `Auto-created sample for unknown barcode: ${normalizedBarcode}`);
-        
-        return res.json({
-          message: 'Sample received and auto-created',
-          sample: newSampleResult.rows[0],
-          order: orderResult.rows[0],
-          auto_created: true
-        });
-      } else {
-        return res.status(404).json({ 
-          error: 'Sample not found',
-          barcode: normalizedBarcode,
-          suggestion: 'Enable auto-create mode or assign barcode to an order first'
-        });
-      }
+      return res.status(404).json({ 
+        error: 'Sample not found',
+        barcode: normalizedBarcode
+      });
     }
     
     const sample = sampleResult.rows[0];
@@ -1895,14 +1205,57 @@ app.post('/api/scanner/receive-sample', authenticateToken, async (req, res) => {
     await logAudit(req.user.userId, 'RECEIVE', 'sample', sample.id, 
       `Received sample: ${normalizedBarcode}`);
     
-    const updatedSampleResult = await query(`
-      SELECT s.*, o.order_number, c.name as customer_name, c.company_name,
-             u.full_name as received_by_name
+    res.json({
+      message: 'Sample received successfully',
+      sample: { ...sample, status: 'received', location, notes },
+      auto_created: false
+    });
+    
+  } catch (error) {
+    console.error('Sample receive error:', error);
+    res.status(500).json({ error: 'Failed to receive sample' });
+  }
+});
+
+app.get('/api/scanner/recent-activity', authenticateToken, async (req, res) => {
+  try {
+    const limit = req.query.limit || 20;
+    
+    const result = await query(`
+      SELECT s.barcode, s.status, s.received_at, s.location,
+             o.order_number, c.name as customer_name,
+             u.full_name as received_by_name,
+             'sample_received' as activity_type
       FROM samples s
       LEFT JOIN orders o ON s.order_id = o.id
       LEFT JOIN customers c ON o.customer_id = c.id
       LEFT JOIN users u ON s.received_by = u.id
-      WHERE s.id = $1
-    `, [sample.id]);
+      WHERE s.received_at IS NOT NULL
+      ORDER BY s.received_at DESC
+      LIMIT $1
+    `, [limit]);
     
     res.json({
+      activity: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Recent activity fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch recent activity' });
+  }
+});
+
+// Start server
+app.listen(PORT, async () => {
+  console.log(`3R Testing LIMS Server running on port ${PORT}`);
+  console.log(`Version: 3.0.0 - Complete`);
+  
+  try {
+    await initializeDatabase();
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+    process.exit(1);
+  }
+});
+
+module.exports = app;
