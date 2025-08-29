@@ -464,13 +464,12 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
   }
 });
 
-// Enhanced barcode assignment endpoint (replace the existing one)
 app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { barcodes } = req.body;
     
-    console.log(`Assigning barcodes to order ${id}:`, barcodes); // Debug log
+    console.log(`Assigning barcodes to order ${id}:`, barcodes);
     
     if (!barcodes || !Array.isArray(barcodes)) {
       return res.status(400).json({ error: 'Barcodes array is required' });
@@ -495,39 +494,32 @@ app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) 
     }
     
     // Validate each barcode format
-    const invalidBarcodes = [];
     const normalizedBarcodes = [];
     
     for (let i = 0; i < barcodes.length; i++) {
       const barcode = barcodes[i].toString().trim().toUpperCase();
       
       if (!barcode) {
-        invalidBarcodes.push(`Empty barcode at position ${i + 1}`);
-        continue;
+        return res.status(400).json({ error: `Empty barcode at position ${i + 1}` });
       }
       
-      if (!validateBarcode(barcode)) {
-        invalidBarcodes.push(`Invalid format: ${barcode} (should be letters followed by numbers, e.g., CA000001)`);
-        continue;
+      // Flexible validation - letters followed by numbers
+      if (!barcode.match(/^[A-Z]+\d+$/)) {
+        return res.status(400).json({ 
+          error: `Invalid barcode format: ${barcode}. Use format like CA000001` 
+        });
       }
       
       normalizedBarcodes.push(barcode);
     }
     
-    if (invalidBarcodes.length > 0) {
-      return res.status(400).json({ 
-        error: 'Invalid barcode formats detected',
-        details: invalidBarcodes 
-      });
-    }
-    
     // Check for duplicates
     const uniqueBarcodes = [...new Set(normalizedBarcodes)];
     if (uniqueBarcodes.length !== normalizedBarcodes.length) {
-      return res.status(400).json({ error: 'Duplicate barcodes detected. Please ensure all barcodes are unique.' });
+      return res.status(400).json({ error: 'Duplicate barcodes detected' });
     }
     
-    // Check if any barcodes already exist in the system
+    // Check if any barcodes already exist
     const existingBarcodesResult = await query(
       'SELECT barcode FROM samples WHERE barcode = ANY($1::text[])',
       [normalizedBarcodes]
@@ -549,20 +541,20 @@ app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) 
       // Delete existing samples for this order
       await client.query('DELETE FROM samples WHERE order_id = $1', [id]);
       
-      // Create new samples with assigned barcodes
+      // Create new samples with assigned barcodes (without sample_type column)
       for (let i = 0; i < normalizedBarcodes.length; i++) {
         const barcode = normalizedBarcodes[i];
         
         await client.query(
-          'INSERT INTO samples (order_id, barcode, sample_type, status) VALUES ($1, $2, $3, $4)',
-          [id, barcode, order.test_type || 'environmental', 'pending']
+          'INSERT INTO samples (order_id, barcode, status) VALUES ($1, $2, $3)',
+          [id, barcode, 'pending']
         );
       }
       
       await client.query('COMMIT');
       
       await logAudit(req.user.userId, 'UPDATE', 'order', id, 
-        `Assigned ${normalizedBarcodes.length} barcodes: ${normalizedBarcodes.slice(0, 3).join(', ')}${normalizedBarcodes.length > 3 ? '...' : ''}`);
+        `Assigned ${normalizedBarcodes.length} barcodes`);
       
       res.json({ 
         message: 'Barcodes assigned successfully',
