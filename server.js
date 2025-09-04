@@ -796,6 +796,9 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 
 app.post('/api/customers', authenticateToken, async (req, res) => {
   try {
+    console.log('Create customer request from user:', req.user);
+    console.log('Request body:', req.body);
+    
     const { name, email, company_name, phone, shipping_address } = req.body;
     
     if (!name || !email) {
