@@ -1,3 +1,4 @@
+
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -823,6 +824,183 @@ app.post('/api/shipping/manual-tracking', authenticateToken, async (req, res) =>
   } catch (error) {
     console.error('Manual tracking error:', error);
     res.status(500).json({ error: 'Failed to add tracking number' });
+  }
+});
+
+// Barcode scanner endpoints
+app.get('/api/scanner/status', authenticateToken, (req, res) => {
+  res.json({
+    hardware_connected: false,
+    last_scan: null,
+    scan_count: 0,
+    scanner_type: 'Socket S700',
+    manual_entry_enabled: true,
+    batch_entry_enabled: true
+  });
+});
+
+app.post('/api/scanner/validate', authenticateToken, async (req, res) => {
+  try {
+    const { barcode } = req.body;
+    
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode is required' });
+    }
+    
+    const isValid = validateBarcode(barcode);
+    
+    if (!isValid) {
+      return res.json({
+        valid: false,
+        error: 'Barcode must be letters followed by numbers (e.g., BC000001)',
+        format: 'BC000001 or CA123456'
+      });
+    }
+    
+    const existingSample = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name 
+      FROM samples s 
+      LEFT JOIN orders o ON s.order_id = o.id 
+      LEFT JOIN customers c ON o.customer_id = c.id 
+      WHERE s.barcode = $1
+    `, [barcode.toUpperCase()]);
+    
+    res.json({
+      valid: true,
+      barcode: barcode.toUpperCase(),
+      exists: existingSample.rows.length > 0,
+      sample_info: existingSample.rows[0] || null
+    });
+    
+  } catch (error) {
+    console.error('Barcode validation error:', error);
+    res.status(500).json({ error: 'Failed to validate barcode' });
+  }
+});
+
+app.post('/api/scanner/validate-batch', authenticateToken, async (req, res) => {
+  try {
+    const { input } = req.body;
+    
+    if (!input || input.trim().length === 0) {
+      return res.status(400).json({ error: 'Batch input is required' });
+    }
+    
+    const lines = input.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    const results = [];
+    
+    for (const line of lines) {
+      const barcode = line.toUpperCase();
+      
+      if (!validateBarcode(barcode)) {
+        return res.status(400).json({ 
+          error: `Invalid barcode format: ${barcode}. Use format like BC000001` 
+        });
+      }
+      
+      const existingSample = await query(
+        'SELECT id FROM samples WHERE barcode = $1',
+        [barcode]
+      );
+      
+      results.push({
+        barcode: barcode,
+        exists: existingSample.rows.length > 0
+      });
+    }
+    
+    const existingCount = results.filter(r => r.exists).length;
+    const newCount = results.filter(r => !r.exists).length;
+    
+    res.json({
+      total_barcodes: results.length,
+      existing_samples: existingCount,
+      new_samples: newCount,
+      results: results
+    });
+    
+  } catch (error) {
+    console.error('Batch validation error:', error);
+    res.status(500).json({ error: 'Failed to validate batch input' });
+  }
+});
+
+app.get('/api/scanner/recent-activity', authenticateToken, async (req, res) => {
+  try {
+    const limit = req.query.limit || 20;
+    
+    const result = await query(`
+      SELECT s.barcode, s.status, o.order_number, c.name as customer_name,
+             'sample_received' as activity_type
+      FROM samples s
+      LEFT JOIN orders o ON s.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
+      WHERE s.status = 'received'
+      ORDER BY s.id DESC
+      LIMIT $1
+    `, [limit]);
+    
+    res.json({
+      activity: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Recent activity fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch recent activity' });
+  }
+});
+
+app.post('/api/scanner/receive-sample', authenticateToken, async (req, res) => {
+  try {
+    const { barcode, location = 'Main Lab', notes = '' } = req.body;
+    
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode is required' });
+    }
+    
+    const normalizedBarcode = barcode.toUpperCase();
+    
+    const sampleResult = await query(`
+      SELECT s.*, o.order_number, c.name as customer_name
+      FROM samples s
+      LEFT JOIN orders o ON s.order_id = o.id
+      LEFT JOIN customers c ON o.customer_id = c.id
+      WHERE s.barcode = $1
+    `, [normalizedBarcode]);
+
+    if (sampleResult.rows.length === 0) {
+      return res.status(404).json({ 
+        error: 'Sample not found',
+        barcode: normalizedBarcode
+      });
+    }
+    
+    const sample = sampleResult.rows[0];
+    
+    if (sample.status === 'received') {
+      return res.json({
+        message: 'Sample was already received',
+        sample,
+        previously_received: true
+      });
+    }
+    
+    await query(`
+      UPDATE samples SET status = 'received' WHERE id = $1
+    `, [sample.id]);
+    
+    await logAudit(req.user.userId, 'RECEIVE', 'sample', sample.id, 
+      `Received sample: ${normalizedBarcode}`);
+    
+    res.json({
+      message: 'Sample received successfully',
+      sample: { ...sample, status: 'received' },
+      auto_created: false
+    });
+    
+  } catch (error) {
+    console.error('Sample receive error:', error);
+    res.status(500).json({ error: 'Failed to receive sample' });
   }
 });
 
