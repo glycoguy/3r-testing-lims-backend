@@ -880,37 +880,118 @@ app.post('/api/scanner/validate', authenticateToken, async (req, res) => {
 
 app.post('/api/scanner/validate-batch', authenticateToken, async (req, res) => {
   try {
+    // Add debugging
+    console.log('=== BATCH VALIDATION DEBUG ===');
+    console.log('Request body:', req.body);
+    console.log('Input value:', req.body.input);
+    console.log('Input type:', typeof req.body.input);
+    
     const { input } = req.body;
     
     if (!input || input.trim().length === 0) {
+      console.log('ERROR: Empty input detected');
       return res.status(400).json({ error: 'Batch input is required' });
     }
     
+    console.log('Processing input:', input);
     const lines = input.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    console.log('Parsed lines:', lines);
+    
     const results = [];
     
     for (const line of lines) {
-      const barcode = line.toUpperCase();
+      console.log('Processing line:', line);
       
-      if (!validateBarcode(barcode)) {
-        return res.status(400).json({ 
-          error: `Invalid barcode format: ${barcode}. Use format like BC000001` 
+      // Handle ranges like CA000001-CA000005
+      if (line.includes('-')) {
+        console.log('Processing as range:', line);
+        const [start, end] = line.split('-').map(s => s.trim().toUpperCase());
+        console.log('Range start:', start, 'Range end:', end);
+        
+        // Extract prefix and numeric parts
+        const startMatch = start.match(/^([A-Z]+)(\d+)$/);
+        const endMatch = end.match(/^([A-Z]+)(\d+)$/);
+        
+        if (!startMatch || !endMatch) {
+          console.log('ERROR: Invalid range format for:', line);
+          return res.status(400).json({ 
+            error: `Invalid range format: ${line}. Use format: CA000001-CA000005` 
+          });
+        }
+        
+        const [, startPrefix, startNumStr] = startMatch;
+        const [, endPrefix, endNumStr] = endMatch;
+        
+        console.log('Start prefix:', startPrefix, 'End prefix:', endPrefix);
+        console.log('Start num:', startNumStr, 'End num:', endNumStr);
+        
+        if (startPrefix !== endPrefix) {
+          console.log('ERROR: Prefix mismatch');
+          return res.status(400).json({ 
+            error: `Range prefixes must match: ${start} to ${end}` 
+          });
+        }
+        
+        const startNum = parseInt(startNumStr);
+        const endNum = parseInt(endNumStr);
+        const numLength = startNumStr.length;
+        
+        console.log('Parsed numbers - start:', startNum, 'end:', endNum, 'length:', numLength);
+        
+        if (startNum > endNum) {
+          console.log('ERROR: Invalid range order');
+          return res.status(400).json({ 
+            error: `Invalid range: start (${startNum}) must be less than end (${endNum})` 
+          });
+        }
+        
+        // Generate range
+        for (let i = startNum; i <= endNum; i++) {
+          const barcode = startPrefix + i.toString().padStart(numLength, '0');
+          console.log('Generated barcode:', barcode);
+          
+          const existingSample = await query(
+            'SELECT id FROM samples WHERE barcode = $1',
+            [barcode]
+          );
+          
+          results.push({
+            barcode: barcode,
+            exists: existingSample.rows.length > 0
+          });
+        }
+      } else {
+        // Handle individual barcodes
+        console.log('Processing as individual barcode:', line);
+        const barcode = line.toUpperCase();
+        
+        if (!validateBarcode(barcode)) {
+          console.log('ERROR: Invalid barcode format:', barcode);
+          return res.status(400).json({ 
+            error: `Invalid barcode format: ${barcode}. Use format like CA000001` 
+          });
+        }
+        
+        const existingSample = await query(
+          'SELECT id FROM samples WHERE barcode = $1',
+          [barcode]
+        );
+        
+        results.push({
+          barcode: barcode,
+          exists: existingSample.rows.length > 0
         });
       }
-      
-      const existingSample = await query(
-        'SELECT id FROM samples WHERE barcode = $1',
-        [barcode]
-      );
-      
-      results.push({
-        barcode: barcode,
-        exists: existingSample.rows.length > 0
-      });
     }
     
     const existingCount = results.filter(r => r.exists).length;
     const newCount = results.filter(r => !r.exists).length;
+    
+    console.log('Final results:', {
+      total: results.length,
+      existing: existingCount,
+      new: newCount
+    });
     
     res.json({
       total_barcodes: results.length,
@@ -921,7 +1002,7 @@ app.post('/api/scanner/validate-batch', authenticateToken, async (req, res) => {
     
   } catch (error) {
     console.error('Batch validation error:', error);
-    res.status(500).json({ error: 'Failed to validate batch input' });
+    res.status(500).json({ error: 'Failed to validate batch input', details: error.message });
   }
 });
 
