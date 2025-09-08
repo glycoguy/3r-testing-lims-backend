@@ -840,7 +840,7 @@ app.post('/api/orders/:id/assign-barcodes', authenticateToken, async (req, res) 
 });
 
 // Enhanced sample receiving with sub-order creation
-app.post('/api/samples/receive', authenticateToken, async (req, res) => {
+app.post('/api/samples/receive-enhanced', authenticateToken, async (req, res) => {
   try {
     const { barcode, location = 'Main Lab', notes = '' } = req.body;
     
@@ -940,6 +940,437 @@ app.post('/api/samples/receive', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to receive sample' });
   }
 });
+
+// Sub-Order Management Functions
+const createSubOrder = async (parentOrderId, receivedSampleIds, userId) => {
+  try {
+    // Get parent order details
+    const parentOrderResult = await query(`
+      SELECT o.*, c.name as customer_name, c.email as customer_email
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      WHERE o.id = $1
+    `, [parentOrderId]);
+    
+    if (parentOrderResult.rows.length === 0) {
+      throw new Error('Parent order not found');
+    }
+    
+    const parentOrder = parentOrderResult.rows[0];
+    
+    // Get next sub-order letter
+    const subOrderLetter = await getNextSubOrderLetter(parentOrderId);
+    const subOrderNumber = `${parentOrder.order_number}${subOrderLetter}`;
+    
+    // Create sub-order
+    const subOrderResult = await query(`
+      INSERT INTO orders (
+        customer_id, order_number, sample_count, test_type,
+        status, parent_order_id, shipping_method, priority,
+        notes, created_by, is_sub_order
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *
+    `, [
+      parentOrder.customer_id,
+      subOrderNumber,
+      receivedSampleIds.length,
+      parentOrder.test_type,
+      'processing',
+      parentOrderId,
+      parentOrder.shipping_method,
+      parentOrder.priority,
+      `Sub-order created from ${parentOrder.order_number} - ${receivedSampleIds.length} samples received`,
+      userId,
+      true
+    ]);
+    
+    const subOrder = subOrderResult.rows[0];
+    
+    // Update received samples to belong to sub-order
+    await query(`
+      UPDATE samples 
+      SET order_id = $1, status = 'processing', processed_at = CURRENT_TIMESTAMP, processed_by = $2
+      WHERE id = ANY($3)
+    `, [subOrder.id, userId, receivedSampleIds]);
+    
+    // Update parent order status
+    await updateParentOrderStatus(parentOrderId);
+    
+    await logAudit(userId, 'CREATE', 'sub_order', subOrder.id, 
+      `Created sub-order ${subOrderNumber} from parent ${parentOrder.order_number} with ${receivedSampleIds.length} samples`);
+    
+    return subOrder;
+    
+  } catch (error) {
+    console.error('Error creating sub-order:', error);
+    throw error;
+  }
+};
+
+const getNextSubOrderLetter = async (parentOrderId) => {
+  try {
+    const result = await query(`
+      SELECT COUNT(*) as sub_order_count 
+      FROM orders 
+      WHERE parent_order_id = $1
+    `, [parentOrderId]);
+    
+    const count = parseInt(result.rows[0].sub_order_count);
+    return String.fromCharCode(97 + count); // 'a', 'b', 'c', etc.
+  } catch (error) {
+    console.error('Error getting sub-order letter:', error);
+    return 'a';
+  }
+};
+
+const updateParentOrderStatus = async (parentOrderId) => {
+  try {
+    // Get all samples for parent order
+    const samplesResult = await query(`
+      SELECT COUNT(*) as total_samples,
+             COUNT(CASE WHEN status = 'received' THEN 1 END) as received_samples,
+             COUNT(CASE WHEN status = 'processing' THEN 1 END) as processing_samples,
+             COUNT(CASE WHEN status = 'complete' THEN 1 END) as complete_samples
+      FROM samples s1
+      WHERE s1.order_id = $1 
+         OR s1.order_id IN (
+           SELECT id FROM orders WHERE parent_order_id = $1
+         )
+    `, [parentOrderId]);
+    
+    const stats = samplesResult.rows[0];
+    const totalSamples = parseInt(stats.total_samples);
+    const receivedSamples = parseInt(stats.received_samples);
+    const processingSamples = parseInt(stats.processing_samples);
+    const completeSamples = parseInt(stats.complete_samples);
+    
+    let newStatus = 'pending';
+    
+    if (completeSamples === totalSamples) {
+      newStatus = 'complete';
+    } else if (processingSamples > 0 || receivedSamples > 0) {
+      newStatus = receivedSamples > 0 ? 'partial' : 'processing';
+    }
+    
+    await query(`
+      UPDATE orders 
+      SET status = $1, updated_at = CURRENT_TIMESTAMP 
+      WHERE id = $2
+    `, [newStatus, parentOrderId]);
+    
+  } catch (error) {
+    console.error('Error updating parent order status:', error);
+  }
+};
+
+// Enhanced Sample Receiving Endpoint
+app.post('/api/samples/receive-enhanced', authenticateToken, async (req, res) => {
+  try {
+    const { barcodes, location = 'Main Lab', notes = '' } = req.body;
+    
+    if (!barcodes || !Array.isArray(barcodes)) {
+      return res.status(400).json({ error: 'Barcodes array is required' });
+    }
+    
+    const receivedSamples = [];
+    const ordersToProcess = new Map();
+    
+    // Process each barcode
+    for (const barcode of barcodes) {
+      // Find sample
+      const sampleResult = await query(`
+        SELECT s.*, o.id as order_id, o.order_number, o.customer_id,
+               c.name as customer_name, c.email as customer_email
+        FROM samples s
+        JOIN orders o ON s.order_id = o.id
+        JOIN customers c ON o.customer_id = c.id
+        WHERE s.barcode = $1
+      `, [barcode]);
+      
+      if (sampleResult.rows.length === 0) {
+        console.warn(`Sample not found for barcode: ${barcode}`);
+        continue;
+      }
+      
+      const sample = sampleResult.rows[0];
+      
+      // Update sample status to received
+      await query(`
+        UPDATE samples 
+        SET status = 'received', 
+            received_at = CURRENT_TIMESTAMP, 
+            received_by = $1,
+            location = $2,
+            notes = COALESCE(notes || E'\n' || $3, $3)
+        WHERE id = $4
+      `, [req.user.userId, location, notes, sample.id]);
+      
+      sample.status = 'received';
+      receivedSamples.push(sample);
+      
+      // Group samples by order for sub-order processing
+      if (!ordersToProcess.has(sample.order_id)) {
+        ordersToProcess.set(sample.order_id, []);
+      }
+      ordersToProcess.get(sample.order_id).push(sample.id);
+    }
+    
+    // Process sub-orders for each parent order
+    const createdSubOrders = [];
+    
+    for (const [orderId, sampleIds] of ordersToProcess) {
+      // Check if this is a partial order (not all samples received)
+      const orderSamplesResult = await query(`
+        SELECT COUNT(*) as total_samples,
+               COUNT(CASE WHEN status = 'received' THEN 1 END) as received_samples
+        FROM samples 
+        WHERE order_id = $1
+      `, [orderId]);
+      
+      const orderStats = orderSamplesResult.rows[0];
+      const totalSamples = parseInt(orderStats.total_samples);
+      const receivedSamples = parseInt(orderStats.received_samples);
+      
+      // If partial order, create sub-order
+      if (receivedSamples < totalSamples && receivedSamples > 0) {
+        const subOrder = await createSubOrder(orderId, sampleIds, req.user.userId);
+        createdSubOrders.push(subOrder);
+      } else if (receivedSamples === totalSamples) {
+        // All samples received, update order status
+        await query(`
+          UPDATE orders 
+          SET status = 'received', updated_at = CURRENT_TIMESTAMP 
+          WHERE id = $1
+        `, [orderId]);
+      }
+    }
+    
+    // Log audit entries
+    for (const sample of receivedSamples) {
+      await logAudit(req.user.userId, 'UPDATE', 'sample', sample.id, 
+        `Sample received: ${sample.barcode} at ${location}`);
+    }
+    
+    res.json({
+      message: `Successfully received ${receivedSamples.length} samples`,
+      received_samples: receivedSamples,
+      sub_orders_created: createdSubOrders,
+      total_processed: barcodes.length,
+      location: location
+    });
+    
+  } catch (error) {
+    console.error('Enhanced sample receiving error:', error);
+    res.status(500).json({ 
+      error: 'Failed to receive samples',
+      details: error.message 
+    });
+  }
+});
+
+// Get Order with Sub-Orders
+app.get('/api/orders/:id/with-suborders', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get parent order
+    const parentOrderResult = await query(`
+      SELECT o.*, c.name as customer_name, c.email as customer_email,
+             c.company_name, c.phone, c.shipping_address
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      WHERE o.id = $1
+    `, [id]);
+    
+    if (parentOrderResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const parentOrder = parentOrderResult.rows[0];
+    
+    // Get sub-orders
+    const subOrdersResult = await query(`
+      SELECT * FROM orders 
+      WHERE parent_order_id = $1 
+      ORDER BY order_number
+    `, [id]);
+    
+    // Get all samples (parent and sub-orders)
+    const samplesResult = await query(`
+      SELECT s.*, o.order_number, o.is_sub_order
+      FROM samples s
+      JOIN orders o ON s.order_id = o.id
+      WHERE o.id = $1 OR o.parent_order_id = $1
+      ORDER BY s.barcode
+    `, [id]);
+    
+    res.json({
+      parent_order: parentOrder,
+      sub_orders: subOrdersResult.rows,
+      all_samples: samplesResult.rows
+    });
+    
+  } catch (error) {
+    console.error('Error fetching order with sub-orders:', error);
+    res.status(500).json({ error: 'Failed to fetch order details' });
+  }
+});
+
+// Batch Management with 96-well Support
+app.post('/api/batches/create-enhanced', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      test_type, 
+      sample_ids = [], 
+      controls = {},
+      plate_layout = '96-well',
+      notes = '',
+      export_format = 'biorad_iq5'
+    } = req.body;
+    
+    // Validate plate capacity
+    const maxSamples = plate_layout === '96-well' ? 96 : 384;
+    const totalWells = sample_ids.length + Object.keys(controls).length;
+    
+    if (totalWells > maxSamples) {
+      return res.status(400).json({ 
+        error: `Batch exceeds ${plate_layout} capacity (${maxSamples} wells)` 
+      });
+    }
+    
+    // Generate batch ID
+    const batchId = `BATCH-${Date.now()}-${test_type}`;
+    
+    // Create batch record
+    const batchResult = await query(`
+      INSERT INTO batches (
+        batch_id, test_type, plate_layout, export_format,
+        sample_count, control_count, status, notes, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
+    `, [
+      batchId, test_type, plate_layout, export_format,
+      sample_ids.length, Object.keys(controls).length,
+      'created', notes, req.user.userId
+    ]);
+    
+    const batch = batchResult.rows[0];
+    
+    // Add samples to batch
+    for (let i = 0; i < sample_ids.length; i++) {
+      await query(`
+        UPDATE samples 
+        SET batch_id = $1, status = 'processing', well_position = $2
+        WHERE id = $3
+      `, [batchId, i + 1, sample_ids[i]]);
+    }
+    
+    // Add controls to batch
+    for (const [controlType, controlData] of Object.entries(controls)) {
+      await query(`
+        INSERT INTO batch_controls (
+          batch_id, control_type, control_name, well_position
+        ) VALUES ($1, $2, $3, $4)
+      `, [
+        batchId,
+        controlType,
+        controlData.name || controlType,
+        controlData.position || (sample_ids.length + Object.keys(controls).indexOf(controlType) + 1)
+      ]);
+    }
+    
+    await logAudit(req.user.userId, 'CREATE', 'batch', batch.id, 
+      `Created ${plate_layout} batch ${batchId} with ${sample_ids.length} samples and ${Object.keys(controls).length} controls`);
+    
+    res.json({
+      message: 'Enhanced batch created successfully',
+      batch: batch,
+      batch_id: batchId,
+      total_wells_used: totalWells,
+      plate_capacity: maxSamples
+    });
+    
+  } catch (error) {
+    console.error('Enhanced batch creation error:', error);
+    res.status(500).json({ error: 'Failed to create batch' });
+  }
+});
+
+// Export Batch as CSV
+app.get('/api/batches/:batch_id/export-csv', authenticateToken, async (req, res) => {
+  try {
+    const { batch_id } = req.params;
+    const { format = 'biorad_iq5' } = req.query;
+    
+    // Get batch details
+    const batchResult = await query(`
+      SELECT * FROM batches WHERE batch_id = $1
+    `, [batch_id]);
+    
+    if (batchResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+    
+    const batch = batchResult.rows[0];
+    
+    // Get samples in batch
+    const samplesResult = await query(`
+      SELECT s.barcode, s.well_position
+      FROM samples s
+      WHERE s.batch_id = $1
+      ORDER BY s.well_position
+    `, [batch_id]);
+    
+    // Get controls in batch
+    const controlsResult = await query(`
+      SELECT control_name, well_position
+      FROM batch_controls
+      WHERE batch_id = $1
+      ORDER BY well_position
+    `, [batch_id]);
+    
+    // Generate CSV based on format
+    let csvContent = '';
+    const maxWells = batch.plate_layout === '96-well' ? 96 : 384;
+    const wells = new Array(maxWells).fill('none');
+    
+    // Fill in samples
+    samplesResult.rows.forEach(sample => {
+      if (sample.well_position && sample.well_position <= maxWells) {
+        wells[sample.well_position - 1] = sample.barcode;
+      }
+    });
+    
+    // Fill in controls
+    controlsResult.rows.forEach(control => {
+      if (control.well_position && control.well_position <= maxWells) {
+        wells[control.well_position - 1] = control.control_name;
+      }
+    });
+    
+    // Format based on instrument type
+    switch (format) {
+      case 'biorad_iq5':
+        csvContent = wells.join('\n');
+        break;
+      case 'biorad_cfx96':
+        csvContent = 'Well,Sample\n' + wells.map((well, index) => `${index + 1},${well}`).join('\n');
+        break;
+      case 'ariamx':
+        csvContent = 'Position,Name\n' + wells.map((well, index) => `${String.fromCharCode(65 + Math.floor(index / 12))}${(index % 12) + 1},${well}`).join('\n');
+        break;
+      default:
+        csvContent = wells.join('\n');
+    }
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${batch_id}_${format}.csv"`);
+    res.send(csvContent);
+    
+  } catch (error) {
+    console.error('Batch CSV export error:', error);
+    res.status(500).json({ error: 'Failed to export batch' });
+  }
+});
+
 
 // Enhanced batch management
 app.get('/api/batches', authenticateToken, async (req, res) => {
