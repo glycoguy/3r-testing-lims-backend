@@ -1,7 +1,7 @@
 {
   "name": "3r-testing-lims-backend",
-  "version": "3.0.0",
-  "description": "3R Testing LIMS Backend with WooCommerce & Manual Shipping Integration",
+  "version": "3.1.0",
+  "description": "3R Testing LIMS Backend with Enhanced Security & Sub-orders",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -17,7 +17,11 @@
     "nodemailer": "^6.9.7",
     "pdfkit": "^0.13.0",
     "axios": "^1.6.0",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "express-rate-limit": "^6.0.0",
+    "helmet": "^7.0.0",
+    "multer": "^1.4.0",
+    "validator": "^13.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
