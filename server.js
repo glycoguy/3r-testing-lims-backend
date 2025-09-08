@@ -1215,7 +1215,7 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
   }
 });
 
-// Enhanced samples endpoint
+// Enhanced samples endpoint 2.0
 app.get('/api/samples', authenticateToken, async (req, res) => {
   try {
     const result = await query(`
@@ -1225,7 +1225,6 @@ app.get('/api/samples', authenticateToken, async (req, res) => {
         s.status,
         s.order_id,
         s.received_at,
-        s.processed_at,
         s.completed_at,
         s.location,
         s.notes,
